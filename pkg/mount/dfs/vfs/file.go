@@ -14,14 +14,18 @@ type StreamingFile struct {
 	closed   atomic.Bool
 }
 
-// NewStreamingFile creates a new streaming file handle
-func NewStreamingFile(item *CacheItem) *StreamingFile {
-	item.Open() // Increment opens count
+// NewStreamingFile creates a new streaming file handle. Returns an error if
+// the item has been claimed for teardown by the cache janitor — the caller
+// must fetch a fresh item (e.g. via Cache.GetItem) and retry.
+func NewStreamingFile(item *CacheItem) (*StreamingFile, error) {
+	if !item.Open() {
+		return nil, errors.New("cache item is being closed, retry")
+	}
 
 	return &StreamingFile{
 		item:     item,
 		fileSize: item.info.Size,
-	}
+	}, nil
 }
 
 // ReadAt implements io.ReaderAt using a background context.

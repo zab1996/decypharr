@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"runtime/debug"
 	"strconv"
 
 	"github.com/puzpuzpuz/xsync/v4"
@@ -80,6 +81,7 @@ func (s *Service) GetLink(ctx context.Context, entry *storage.Entry, filename st
 					Str("infohash", entry.InfoHash).
 					Str("filename", filename).
 					Interface("panic", r).
+					Str("stack", string(debug.Stack())).
 					Msg("Recovered panic in GetLink — marking entry as Bad")
 				s.markEntryBad(entry, filename, 0, "panic_recovered")
 			}
@@ -285,6 +287,14 @@ func (s *Service) fetchLink(ctx context.Context, entry *storage.Entry, filename 
 		if entry.Bad {
 			return emptyDownloadLink, fmt.Errorf("can't repair %s since it's been marked as bad", entry.GetFolder())
 		}
+		if s.repairer == nil {
+			// No repairer configured (e.g. this fork's CLI-managed re-insertion) —
+			// mark bad immediately so CLI can handle it, same as handleBadLink's
+			// no-repairer path. Without this check, calling a nil s.repairer
+			// panics (nil func value).
+			s.markEntryBad(entry, filename, attempt, "empty_link")
+			return emptyDownloadLink, fmt.Errorf("entry %s is broken (no repairer configured)", entry.GetFolder())
+		}
 		if attempt >= MaxReinsertionAttempt {
 			s.markEntryBad(entry, filename, attempt, "empty_link")
 			return emptyDownloadLink, fmt.Errorf("entry %s file %s still resolves to an empty link after %d re-insertion attempts", entry.GetFolder(), filename, attempt)
@@ -337,6 +347,17 @@ func (s *Service) getPlacementFile(entry *storage.Entry, filename string) (*stor
 				fmt.Errorf("failed to refresh entry: %w", err),
 				"refresh_failed",
 			)
+		}
+		if refreshed == nil {
+			// EntryRefresher (Manager.refreshTorrent) legitimately returns
+			// (nil, nil) when the provider's file list is still incomplete
+			// (e.g. a season pack where the debrid API dropped some links —
+			// isComplete fails, processSyncTorrent returns nil, nil) — this
+			// is not an error, just "not ready yet". Treat it the same as a
+			// missing file below: hoster unavailable, so handleBadLink can
+			// mark it bad / trigger re-insertion instead of a nil dereference
+			// on refreshed.Files.
+			return nil, customerror.HosterUnavailableError
 		}
 
 		file := refreshed.Files[filename]

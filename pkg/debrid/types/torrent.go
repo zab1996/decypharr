@@ -125,9 +125,10 @@ type IngestData struct {
 }
 
 type LibraryStats struct {
-	Total       int `json:"total"`
-	Bad         int `json:"bad"`
-	ActiveLinks int `json:"active_links"`
+	Total       int   `json:"total"`
+	TotalSize   int64 `json:"total_size"`
+	Bad         int   `json:"bad"`
+	ActiveLinks int   `json:"active_links"`
 }
 
 type Stats struct {

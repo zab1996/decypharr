@@ -36,6 +36,11 @@ var retriableErrorStrings = []string{
 	"server closed idle connection",
 	"client connection force closed",
 	"context deadline exceeded",
+	// DFS Downloaders.DownloadWithPriority rejects new work while StopAll()
+	// is mid-teardown (idle-timeout close racing a fresh read). The teardown
+	// is normally sub-second, so a short bounded retry (see DownloadWithRetry)
+	// rides it out instead of surfacing a permanent read failure.
+	"downloaders stopping",
 }
 
 // permanentErrorStrings contains error message substrings that indicate non-retriable errors

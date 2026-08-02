@@ -182,17 +182,27 @@ func NewCache(ctx context.Context, mgr *manager.Manager, config *config.FuseConf
 func (c *Cache) GetItem(entryName, filename string, fileSize int64) (*CacheItem, error) {
 	key := buildCacheKey(entryName, filename)
 
-	// Fast path: already exists
-	if item, ok := c.items.Load(key); ok {
+	// Fast path: already exists and isn't being torn down by the janitor.
+	if item, ok := c.items.Load(key); ok && !item.isClaimed() {
 		item.touch()
 		return item, nil
 	}
 
 	// Slow path: create with singleflight to avoid global lock
 	val, err, _ := c.createGroup.Do(key, func() (interface{}, error) {
-		if item, ok := c.items.Load(key); ok {
-			item.touch()
-			return item, nil
+		// A claimed item is about to be deleted from the map by the janitor
+		// (claim and delete are adjacent in cleanupItems); wait the removal
+		// out so we create a fresh item instead of handing back a dying one.
+		for {
+			item, ok := c.items.Load(key)
+			if !ok {
+				break
+			}
+			if !item.isClaimed() {
+				item.touch()
+				return item, nil
+			}
+			runtime.Gosched()
 		}
 		item, err := c.newItem(key, entryName, filename, fileSize)
 		if err != nil {
@@ -571,7 +581,7 @@ func (c *Cache) evictLoop() {
 }
 
 func (c *Cache) cleanupItems(now time.Time, forceZeroOpen bool) int {
-	var evicted []string
+	evicted := 0
 	c.items.Range(func(key string, item *CacheItem) bool {
 		if item.opens.Load() > 0 {
 			return true // Still open, keep in map
@@ -581,21 +591,28 @@ func (c *Cache) cleanupItems(now time.Time, forceZeroOpen bool) int {
 		lastAccess := item.info.ATime
 		item.metaMu.RUnlock()
 
-		if forceZeroOpen || now.Sub(lastAccess) > itemIdleTimeout {
-			evicted = append(evicted, key)
+		if !forceZeroOpen && now.Sub(lastAccess) <= itemIdleTimeout {
+			return true
 		}
+
+		// Claim before touching anything: this fences out a concurrent
+		// GetItem/Open that already loaded this item from the map (its Open
+		// fails and it fetches a fresh item instead). Previously the close
+		// happened after an unfenced opens check, so a handle opening in that
+		// window would read from an item whose buffer was being torn down.
+		// Delete from the map before the (potentially slow) Close so waiting
+		// creators aren't stalled. xsync.Map supports modification during Range.
+		if !item.claimForClose() {
+			return true
+		}
+		c.items.Delete(key)
+		_ = item.Close()
+		c.itemCount.Add(-1)
+		evicted++
 		return true
 	})
 
-	// Actually evict the items (outside the Range to avoid concurrent modification)
-	for _, key := range evicted {
-		if item, ok := c.items.LoadAndDelete(key); ok {
-			_ = item.Close()
-			c.itemCount.Add(-1)
-		}
-	}
-
-	return len(evicted)
+	return evicted
 }
 
 func combineDiskScanResults(first, second diskScanResult) diskScanResult {
@@ -961,6 +978,7 @@ type CacheItem struct {
 	handleMu              sync.Mutex
 	releaseStopTimer      *time.Timer
 	releaseStopGeneration uint64
+	claimed               bool // set by claimForClose; guarded by handleMu
 
 	metaDirty   atomic.Bool
 	metaFlushCh chan struct{}
@@ -1069,15 +1087,42 @@ func (item *CacheItem) touch() {
 	item.markMetadataDirty()
 }
 
-// Open increments the open count (prevents eviction)
 // Open increments the open count (prevents eviction) and cancels any pending
-// delayed downloader stop from a recent zero-open interval.
-func (item *CacheItem) Open() {
+// delayed downloader stop from a recent zero-open interval. It returns false
+// if the cache janitor has already claimed this item for teardown — the
+// caller must fetch a fresh item instead of using this one.
+func (item *CacheItem) Open() bool {
 	item.handleMu.Lock()
+	if item.claimed {
+		item.handleMu.Unlock()
+		return false
+	}
 	item.opens.Add(1)
 	item.cancelPendingDownloaderStopLocked()
 	item.handleMu.Unlock()
 	item.touch()
+	return true
+}
+
+// claimForClose atomically claims an idle (opens == 0, not already claimed)
+// item for teardown, fencing out any future Open. Only the cache janitor
+// (cleanupItems) calls this. Returns false if the item currently has open
+// handles or is already claimed, in which case the caller must leave it alone.
+func (item *CacheItem) claimForClose() bool {
+	item.handleMu.Lock()
+	defer item.handleMu.Unlock()
+	if item.claimed || item.opens.Load() != 0 {
+		return false
+	}
+	item.claimed = true
+	return true
+}
+
+// isClaimed reports whether the janitor has claimed this item for teardown.
+func (item *CacheItem) isClaimed() bool {
+	item.handleMu.Lock()
+	defer item.handleMu.Unlock()
+	return item.claimed
 }
 
 // Release decrements the open count. When the last handle closes, downloaders
@@ -1092,7 +1137,11 @@ func (item *CacheItem) Release() {
 		return
 	}
 	if newCount < 0 {
-		item.opens.Store(0)
+		// Unbalanced release. Undo rather than Store(0): a blind store could
+		// stomp a concurrent Open's increment and mask which call is the
+		// actual double-Release.
+		item.opens.Add(1)
+		return
 	}
 	item.scheduleDownloaderStopLocked()
 }
@@ -1173,6 +1222,21 @@ func (item *CacheItem) ReadAtContext(ctx context.Context, p []byte, off int64) (
 	if dls == nil {
 		return 0, errors.New("downloaders closed")
 	}
+
+	// Publish the read position BEFORE downloading and reading, not just after.
+	// The pool's disk backstop punches everything behind readHead-BackWindow; if
+	// readHead still pointed at the previous (forward) position during a seek-back,
+	// the backstop could punch the very range we re-download here right back out
+	// from under the read — and the buffer's lock-free fast read path would hand
+	// the resulting hole back as zeros with no error. Setting readHead to off
+	// first pulls the protected frontier over [off, ...) for the whole
+	// download-then-read sequence; we advance it to off+n afterward for forward
+	// progress. (SetReadHead is a cheap atomic store and non-monotonic by design,
+	// so pulling it back on a seek-back is exactly the intended behavior.)
+	if item.buf != nil {
+		item.buf.SetReadHead(off)
+	}
+
 	// Prioritize media-probe-style near-EOF reads so they don't queue behind
 	// bulk prefetch, and retry transient failures a few times before surfacing
 	// EIO — ffprobe treats a single read error as fatal.
@@ -1194,9 +1258,10 @@ func (item *CacheItem) ReadAtContext(ctx context.Context, p []byte, off int64) (
 	}
 	n, err := item.buf.ReadAt(p, off)
 	if err == nil || errors.Is(err, io.EOF) {
-		// Publish the read position so the pool's disk backstop knows what is
-		// safe to punch (everything behind off-BackWindow) once the cache is
-		// over its disk limit, and so RAM eviction protects the active window.
+		// Advance the read position to the end of what we just served. The region
+		// we read was already protected by the SetReadHead(off) above; this moves
+		// the frontier forward so the backstop can reclaim behind us on the next
+		// sequential read, and so RAM eviction protects the active window ahead.
 		item.buf.SetReadHead(off + int64(n))
 		if margin := item.cache.config.DropBehindMargin; margin > 0 {
 			item.buf.DropBehind(off+int64(n), margin)
@@ -1309,11 +1374,14 @@ func (item *CacheItem) Close() error {
 		item.stopMetaWriter()
 		item.flushMetadata(true)
 
+		// Deliberately do NOT nil item.buf: the field is read without
+		// synchronization by ReadAtContext/WriteAtNoOverwrite, so nilling it
+		// here was a data race (and a latent nil deref) against a straggler
+		// read. Left set, a post-Close access gets buffer.ErrClosed instead.
 		if item.buf != nil {
 			if err := item.buf.Close(); err != nil && item.closeErr == nil {
 				item.closeErr = err
 			}
-			item.buf = nil
 		}
 	})
 	return item.closeErr

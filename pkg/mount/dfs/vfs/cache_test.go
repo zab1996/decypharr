@@ -1,6 +1,7 @@
 package vfs
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -346,7 +347,14 @@ func TestCleanupItems_ForceZeroOpenClosesRecentItems(t *testing.T) {
 	if got := c.itemCount.Load(); got != 0 {
 		t.Fatalf("expected item count 0 after forced cleanup, got %d", got)
 	}
-	if item.buf != nil {
-		t.Fatal("expected cache buffer to be closed after forced cleanup")
+	// item.buf is deliberately left set (not nilled) after Close — nilling it
+	// was a data race against unsynchronized reads elsewhere (ReadAtContext /
+	// WriteAtNoOverwrite). Verify closure via the buffer's own closed-state
+	// contract instead of the (now-intentionally-stale) nil check.
+	if item.buf == nil {
+		t.Fatal("expected item.buf to remain set after Close")
+	}
+	if _, err := item.buf.ReadAt(make([]byte, 1), 0); !errors.Is(err, buffer.ErrClosed) {
+		t.Fatalf("expected cache buffer to report closed after forced cleanup, got err=%v", err)
 	}
 }

@@ -12,11 +12,19 @@ type Snapshot struct {
 	Debrids       []types.Stats     `json:"debrids"`
 	Mount         MountStats        `json:"mount"`
 	Usenet        map[string]any    `json:"usenet,omitempty"`
+	Content       ContentStats      `json:"content"`
 	ActiveStreams ActiveStreamStats `json:"active_streams"`
 	Storage       StorageStats      `json:"storage"`
 	Queue         QueueStats        `json:"queue"`
 	Arrs          ArrStats          `json:"arrs"`
 	Repair        RepairStats       `json:"repair"`
+}
+
+// ContentStats is the combined count/size of everything currently
+// mounted/available across every debrid provider and usenet, added together.
+type ContentStats struct {
+	TotalCount int   `json:"total_count"`
+	TotalSize  int64 `json:"total_size"`
 }
 
 type SystemStats struct {

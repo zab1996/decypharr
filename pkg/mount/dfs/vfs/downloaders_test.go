@@ -187,6 +187,13 @@ func TestStopAllClearsWaiters(t *testing.T) {
 }
 
 func TestCacheItemReleaseStopsDownloadersOnZeroOpens(t *testing.T) {
+	// Release() only stops downloaders after releaseStopGracePeriodNanos (2s
+	// by default, to absorb rapid close/reopen cycles) — shrink it for this
+	// test so we don't need a multi-second sleep, and restore it afterward
+	// since it's a shared package-level value.
+	prevGracePeriod := releaseStopGracePeriodNanos.Swap(int64(10 * time.Millisecond))
+	t.Cleanup(func() { releaseStopGracePeriodNanos.Store(prevGracePeriod) })
+
 	parentCtx := context.Background()
 	ctx, cancel := context.WithCancel(parentCtx)
 
@@ -205,7 +212,7 @@ func TestCacheItemReleaseStopsDownloadersOnZeroOpens(t *testing.T) {
 
 	select {
 	case <-ctx.Done():
-	case <-time.After(200 * time.Millisecond):
+	case <-time.After(500 * time.Millisecond):
 		t.Fatal("expected downloader context to be canceled when opens reaches zero")
 	}
 

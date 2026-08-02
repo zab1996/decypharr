@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -169,6 +170,32 @@ func (c *Client) Get(url string) (*http.Response, error) {
 	return c.Do(req)
 }
 
+// retryAfterBackoff extends DefaultBackoff with Retry-After header support.
+// When a 429 response carries a Retry-After header the client waits exactly as
+// long as the server requests instead of using jittered exponential backoff.
+func retryAfterBackoff(min, max time.Duration, attemptNum int, resp *http.Response) time.Duration {
+	if resp != nil && resp.StatusCode == http.StatusTooManyRequests {
+		if ra := resp.Header.Get("Retry-After"); ra != "" {
+			if secs, err := strconv.Atoi(ra); err == nil && secs > 0 {
+				wait := time.Duration(secs) * time.Second
+				if wait > max {
+					return max
+				}
+				return wait
+			}
+			if t, err := http.ParseTime(ra); err == nil {
+				if wait := time.Until(t); wait > 0 {
+					if wait > max {
+						return max
+					}
+					return wait
+				}
+			}
+		}
+	}
+	return retryablehttp.DefaultBackoff(min, max, attemptNum, resp)
+}
+
 // New creates a new HTTP client with the specified options
 func New(options ...ClientOption) *Client {
 	client := &Client{
@@ -231,6 +258,7 @@ func New(options ...ClientOption) *Client {
 	retryClient.RetryWaitMin = 1 * time.Second
 	retryClient.RetryWaitMax = 30 * time.Second
 	retryClient.Logger = nil // Disable default logging
+	retryClient.Backoff = retryAfterBackoff
 
 	// Custom retry policy based on retryable status codes
 	retryClient.CheckRetry = func(ctx context.Context, resp *http.Response, err error) (bool, error) {

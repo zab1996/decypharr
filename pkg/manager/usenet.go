@@ -157,7 +157,11 @@ func (m *Manager) UsenetStats() map[string]interface{} {
 	if m.usenet == nil {
 		return nil
 	}
-	return m.usenet.Stats()
+	stats := m.usenet.Stats()
+	contentSize, contentCount := m.storage.NZBContentStats()
+	stats["content_size"] = contentSize
+	stats["content_count"] = contentCount
+	return stats
 }
 
 // SpeedTestRequest represents a speed test request payload

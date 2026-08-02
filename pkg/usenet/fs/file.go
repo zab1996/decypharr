@@ -184,6 +184,7 @@ func (vf *File) getOrCreateStreamingReader() *reader.StreamingReader {
 				reader.WithMaxConnections(readerConfig.MaxConnections),
 				reader.WithPrefetchAhead(readerConfig.PrefetchAhead),
 				reader.WithDiskPath(readerConfig.DiskPath),
+				reader.WithLogger(vf.logger),
 			)
 		} else {
 			r, err = reader.NewStreamingReader(
@@ -194,6 +195,7 @@ func (vf *File) getOrCreateStreamingReader() *reader.StreamingReader {
 				reader.WithMaxConnections(readerConfig.MaxConnections),
 				reader.WithPrefetchAhead(readerConfig.PrefetchAhead),
 				reader.WithDiskPath(readerConfig.DiskPath),
+				reader.WithLogger(vf.logger),
 			)
 		}
 

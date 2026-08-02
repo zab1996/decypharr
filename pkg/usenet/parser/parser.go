@@ -279,10 +279,12 @@ func renameMediaFiles(files []storage.NZBFile, mode config.DeobfuscateMode, nzbN
 		return mediaFiles[i].Number < mediaFiles[j].Number
 	})
 	if len(mediaFiles) == 1 {
-		if !looksObfuscatedName(mediaFiles[0].Name) {
-			logMediaNameDecision(logger, "kept_discovered", "single_meaningful_name", mediaFiles[0].Name, mediaFiles[0].Name)
-			return
-		}
+		// Always rename single-file NZBs to the NZB entry name when deobfuscation
+		// is enabled. For single files the NZB entry name (set by cli_debrid) is
+		// always more useful than whatever the indexer embedded in the NZB subject
+		// line — whether that is a raw release name, a hash, or anything else.
+		// The looksObfuscatedName guard only makes sense for multi-file packs where
+		// individual per-episode names should be preserved.
 		oldName := mediaFiles[0].Name
 		fileExt := filepath.Ext(mediaFiles[0].Name)
 		nzbExt := filepath.Ext(nzbName)
@@ -291,7 +293,7 @@ func renameMediaFiles(files []storage.NZBFile, mode config.DeobfuscateMode, nzbN
 		} else {
 			mediaFiles[0].Name = nzbName
 		}
-		logMediaNameDecision(logger, "fallback_renamed", "single_obfuscated_name", oldName, mediaFiles[0].Name)
+		logMediaNameDecision(logger, "fallback_renamed", "single_file_nzb_name", oldName, mediaFiles[0].Name)
 		return
 	}
 	if shouldKeepDetectedMediaNames(mediaFiles) {

@@ -284,13 +284,24 @@ func buildExtractedArchiveFiles(
 			copy(segments, baseSegments)
 		}
 
+		// A file extracted from an archive is classified by its own content,
+		// not by the archive it came from (see rar.go/7z.go's identical fix).
+		// renameMediaFiles (parser.go) only ever treats FileType==Media as a
+		// deobfuscation-rename candidate, so leaving every extracted file
+		// tagged with the archive's own type made every archive-delivered
+		// media file permanently invisible to that pass.
+		effectiveFileType := fileType
+		if utils.IsMediaFile(name) {
+			effectiveFileType = storage.NZBFileTypeMedia
+		}
+
 		files = append(files, &storage.NZBFile{
 			Name:         name,
 			InternalPath: info.InternalPath,
 			Groups:       getGroupsList(group.Groups),
 			Segments:     segments,
 			Password:     password,
-			FileType:     fileType,
+			FileType:     effectiveFileType,
 			Size:         info.FileSize,
 			IsStored:     info.IsStored,
 		})

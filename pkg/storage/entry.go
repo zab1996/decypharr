@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sirrobot01/decypharr/internal/config"
 	"github.com/sirrobot01/decypharr/pkg/storage/hybrid"
 	"google.golang.org/protobuf/proto"
 )
@@ -212,6 +213,49 @@ func (s *Storage) Delete(infohash string) error {
 // Count returns the number of entries
 func (s *Storage) Count() (int, error) {
 	return s.entries.Len(), nil
+}
+
+// NZBContentStats sums the size and count of NZB-protocol entries directly
+// from the in-memory index (no disk reads, no protobuf decode) - the total
+// bytes of usenet-sourced media currently mounted/available.
+func (s *Storage) NZBContentStats() (totalSize int64, count int) {
+	_ = s.entries.ForEachMeta(func(key string, meta *hybrid.IndexEntry) error {
+		if meta.Protocol == string(config.ProtocolNZB) {
+			totalSize += meta.TotalSize
+			count++
+		}
+		return nil
+	})
+	return totalSize, count
+}
+
+// ContentStatsByProvider sums the size and count of torrent-protocol entries
+// per active debrid provider, directly from the in-memory index (no disk
+// reads, no protobuf decode). Keyed by ActiveProvider (e.g. "realdebrid"),
+// matching the debrid client names used elsewhere in stats. Entries with no
+// active provider set are skipped rather than attributed to a blank key.
+func (s *Storage) ContentStatsByProvider() map[string]*ProviderContentStats {
+	out := make(map[string]*ProviderContentStats)
+	_ = s.entries.ForEachMeta(func(key string, meta *hybrid.IndexEntry) error {
+		if meta.Protocol != string(config.ProtocolTorrent) || meta.Provider == "" {
+			return nil
+		}
+		stats := out[meta.Provider]
+		if stats == nil {
+			stats = &ProviderContentStats{}
+			out[meta.Provider] = stats
+		}
+		stats.TotalSize += meta.TotalSize
+		stats.Count++
+		return nil
+	})
+	return out
+}
+
+// ProviderContentStats is one debrid provider's slice of ContentStatsByProvider.
+type ProviderContentStats struct {
+	TotalSize int64
+	Count     int
 }
 
 // updateEntryItem updates the name index

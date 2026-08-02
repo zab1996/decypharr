@@ -144,6 +144,9 @@ func (c *Collector) collect() *Snapshot {
 		snap.Usenet = c.mgr.UsenetStats()
 	}
 
+	// --- Content (combined debrid + usenet totals) ---
+	snap.Content = combinedContentStats(snap.Debrids, snap.Usenet)
+
 	// --- Active Streams ---
 	// cli_debrid_ids are attached to each stream at TrackStream time (see stream.go)
 	// so no extra lookup is needed here.
@@ -199,13 +202,33 @@ func (c *Collector) collect() *Snapshot {
 	return snap
 }
 
+// combinedContentStats sums content count/size across every debrid provider
+// and usenet. usenet is the raw map[string]any from Manager.UsenetStats() (nil
+// when usenet isn't configured); its content_count/content_size keys are set
+// in pkg/manager/usenet.go.
+func combinedContentStats(debrids []debridTypes.Stats, usenet map[string]any) ContentStats {
+	var total ContentStats
+	for _, d := range debrids {
+		total.TotalCount += d.Library.Total
+		total.TotalSize += d.Library.TotalSize
+	}
+	if usenet != nil {
+		if v, ok := usenet["content_count"].(int); ok {
+			total.TotalCount += v
+		}
+		if v, ok := usenet["content_size"].(int64); ok {
+			total.TotalSize += v
+		}
+	}
+	return total
+}
+
 // collectDebrids gathers debrid stats with cached profiles.
 func (c *Collector) collectDebrids(cfg *config.Config) []debridTypes.Stats {
-	torrentCount, err := c.mgr.GetTorrentsCount()
-	if err != nil {
-		c.logger.Error().Err(err).Msg("Failed to get torrents count for debrid stats")
-		torrentCount = 0
-	}
+	// Per-provider, not global: previously every debrid client reported the
+	// same whole-store torrent count, which only looked right when exactly
+	// one provider was configured.
+	byProvider := c.mgr.Storage().ContentStatsByProvider()
 
 	profiles := c.getProfiles()
 
@@ -225,7 +248,10 @@ func (c *Collector) collectDebrids(cfg *config.Config) []debridTypes.Stats {
 		profile.Name = debridName
 		ds.Profile = profile
 
-		ls.Total = torrentCount
+		if s := byProvider[debridName]; s != nil {
+			ls.Total = s.Count
+			ls.TotalSize = s.TotalSize
+		}
 		ls.ActiveLinks = c.mgr.GetTotalActiveDownloadLinks()
 		ds.Library = ls
 		ds.Accounts = client.AccountManager().Stats()

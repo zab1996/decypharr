@@ -157,7 +157,7 @@ class ConfigManager {
         if (!repair) return;
         const $ = (id) => document.getElementById(id);
         if ($('repair.enabled')) $('repair.enabled').checked = !!repair.enabled;
-        if ($('repair.source')) $('repair.source').value = repair.source || 'arr';
+        if ($('repair.source')) $('repair.source').value = 'managed'; // only 'managed' is supported
         if ($('repair.schedule')) $('repair.schedule').value = repair.schedule || '';
         if ($('repair.recheck_interval')) $('repair.recheck_interval').value = repair.recheck_interval || '';
         if ($('repair.workers')) $('repair.workers').value = repair.workers || 5;
@@ -175,7 +175,7 @@ class ConfigManager {
             : [];
         return {
             enabled: $('repair.enabled')?.checked || false,
-            source: $('repair.source')?.value || 'arr',
+            source: 'managed', // only 'managed' is supported
             schedule: $('repair.schedule')?.value.trim() || '',
             recheck_interval: $('repair.recheck_interval')?.value.trim() || '',
             workers: parseInt($('repair.workers')?.value, 10) || 0,

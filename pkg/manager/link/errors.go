@@ -147,8 +147,21 @@ func ErrorCodeToLinkError(code string) *Error {
 		return NewRetryableError(Err429, code)
 	case "503":
 		return NewRetryableError(Err503, code)
+	// 500/502/504 are transient upstream failures, not evidence the file is
+	// gone. Categorizing them Retryable (not Permanent) matters for two
+	// reasons: fetchAndValidate's cache-skip guard (see
+	// isRetryableValidationError in service.go) only excludes Retryable
+	// errors from s.validated, and downloader.go's rate-limit backoff loop
+	// only retries when ShouldRetry() is true. A Permanent categorization
+	// here would let one transient 5xx poison the validated-link cache for
+	// the rest of the process lifetime — only a restart would clear it.
+	case "500", "502", "504":
+		return NewRetryableError(fmt.Errorf("HTTP %s from provider", code), code)
 	default:
-		return NewPermanentError(fmt.Errorf("unknown error code: %s", code), code)
+		// An unrecognised code is not evidence of permanent failure either,
+		// for the same reason as above — treat it the same as a transient
+		// 5xx rather than poisoning the cache.
+		return NewRetryableError(fmt.Errorf("unknown error code: %s", code), code)
 	}
 }
 

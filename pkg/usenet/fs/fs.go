@@ -108,7 +108,7 @@ func (f *FS) Open(name string) (fs.File, error) {
 		manager:       f.client,
 		maxConcurrent: f.maxConcurrent,
 		prefetchSize:  f.prefetchSize,
-		logger:        f.logger,
+		logger:        f.logger.With().Str("filename", name).Logger(),
 		volume:        vol,
 	}, nil
 }
@@ -242,6 +242,7 @@ func (f *FS) createNewReaderForVolume(vol *types.Volume) (PrefetchableReaderAt, 
 			reader.WithMaxConnections(readerConfig.MaxConnections),
 			reader.WithPrefetchAhead(readerConfig.PrefetchAhead),
 			reader.WithDiskPath(readerConfig.DiskPath),
+			reader.WithLogger(f.logger),
 		)
 	} else {
 		streamReader, err = reader.NewStreamingReader(
@@ -252,6 +253,7 @@ func (f *FS) createNewReaderForVolume(vol *types.Volume) (PrefetchableReaderAt, 
 			reader.WithMaxConnections(readerConfig.MaxConnections),
 			reader.WithPrefetchAhead(readerConfig.PrefetchAhead),
 			reader.WithDiskPath(readerConfig.DiskPath),
+			reader.WithLogger(f.logger),
 		)
 	}
 

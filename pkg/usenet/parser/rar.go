@@ -214,13 +214,25 @@ func (p *RARParser) Process(ctx context.Context, group *FileGroup, password stri
 			size = streamSize
 		}
 
+		// A file extracted from a RAR archive is classified by its own content,
+		// not by the archive it came from. renameMediaFiles (parser.go) only
+		// ever sees FileType==Media as a candidate for deobfuscation renaming,
+		// so leaving every extracted file tagged NZBFileTypeRar made every
+		// RAR-delivered release (the overwhelming majority of scene releases)
+		// permanently invisible to that pass — the raw scene filename would
+		// survive untouched even when cli_debrid's NZB/folder name was correct.
+		fileType := storage.NZBFileTypeRar
+		if utils.IsMediaFile(name) {
+			fileType = storage.NZBFileTypeMedia
+		}
+
 		file := &storage.NZBFile{
 			Name:          name,
 			InternalPath:  rarFile.Name,
 			Groups:        getGroupsList(group.Groups),
 			Segments:      fileSegments, // Direct segment list with offsets!
 			Password:      password,
-			FileType:      storage.NZBFileTypeRar,
+			FileType:      fileType,
 			Size:          size,
 			IsStored:      rarFile.IsStored,
 			IsEncrypted:   rarFile.IsEncrypted, // Per-file encryption from extra area
