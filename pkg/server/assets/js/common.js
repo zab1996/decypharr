@@ -388,8 +388,8 @@ class DecypharrUtils {
 
             if (versionBadge) {
                 versionBadge.innerHTML = `
-                    <a href="https://github.com/sirrobot01/decypharr/releases/tag/v${data.version}" 
-                       target="_blank" 
+                    <a href="https://github.com/mash2k3/decypharr/releases/tag/${data.channel}-${data.version}"
+                       target="_blank"
                        class="text-current hover:text-primary transition-colors">
                         ${data.channel}-${data.version}
                     </a>

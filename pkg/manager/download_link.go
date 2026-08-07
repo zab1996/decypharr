@@ -49,3 +49,19 @@ func (m *Manager) GetTotalActiveDownloadLinks() int {
 
 	return total
 }
+
+// GetActiveDownloadLinksForClient returns the number of active download links
+// for a single debrid client's accounts. Use this instead of
+// GetTotalActiveDownloadLinks when reporting per-provider stats — the total
+// variant sums every provider and would report the same combined number for
+// each of them.
+func GetActiveDownloadLinksForClient(client debrid.Client) int {
+	if client == nil {
+		return 0
+	}
+	total := 0
+	for _, acc := range client.AccountManager().Active() {
+		total += acc.DownloadLinksCount()
+	}
+	return total
+}

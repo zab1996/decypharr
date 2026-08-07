@@ -562,7 +562,12 @@ func (tb *Torbox) GetTorrents() ([]*types.Torrent, error) {
 	for {
 		torrents, err := tb.getTorrents(offset)
 		if err != nil {
-			break
+			// A mid-pagination failure must propagate as an error, not be
+			// swallowed — returning the partial list with a nil error here
+			// makes the caller (syncTorrents) believe the fetch was complete,
+			// causing it to treat every torrent on the un-fetched remaining
+			// pages as "removed from remote" and delete it from local storage.
+			return nil, err
 		}
 		if len(torrents) == 0 {
 			break

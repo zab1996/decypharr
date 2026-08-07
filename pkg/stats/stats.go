@@ -252,7 +252,7 @@ func (c *Collector) collectDebrids(cfg *config.Config) []debridTypes.Stats {
 			ls.Total = s.Count
 			ls.TotalSize = s.TotalSize
 		}
-		ls.ActiveLinks = c.mgr.GetTotalActiveDownloadLinks()
+		ls.ActiveLinks = manager.GetActiveDownloadLinksForClient(client)
 		ds.Library = ls
 		ds.Accounts = client.AccountManager().Stats()
 

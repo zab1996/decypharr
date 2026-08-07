@@ -690,8 +690,16 @@ func (m *Manager) clearBadFlagsForHealthyTorrents() {
 //  1. Entries sharing the same EntryItem folder name where one is CLI-renamed
 //     and the other is not (same content, different folder name format).
 //
-//  2. Broken entries with raw RD filenames whose exact file size matches a
-//     healthy CLI-renamed entry (ghost created by old Decypharr self-repair).
+//  2. Stale raw-name entryItem keys with no backing entry row, detected via
+//     info-hash (see Case 3 below) — NOT by file size. An earlier revision of
+//     this function also matched broken raw-named entries against CLI-renamed
+//     entries purely by exact file size ("Case 2"). That heuristic was removed:
+//     file size is not a unique key — unrelated releases routinely land on the
+//     same byte count (standardized encode/bitrate tiers), which caused it to
+//     misidentify distinct, valid torrents as "ghosts" of each other and delete
+//     them from the debrid provider. Do not reintroduce a size-only match here;
+//     any replacement must key off info-hash or another value that is actually
+//     unique per torrent.
 func (m *Manager) deleteGhostEntries() {
 	deleted := 0
 
@@ -746,65 +754,6 @@ func (m *Manager) deleteGhostEntries() {
 		}
 		return nil
 	})
-
-	// Case 2: broken entries with raw names whose file size matches a healthy CLI entry
-	// Build a size map of all healthy CLI-renamed entries
-	type cliEntry struct {
-		name string
-		hash string
-	}
-	cliSizeMap := make(map[int64]cliEntry)
-	_ = m.storage.ForEach(func(e *storage.Entry) error {
-		if e.Protocol != "torrent" {
-			return nil
-		}
-		if e.Name == "" || e.OriginalFilename == "" || e.Name == e.OriginalFilename {
-			return nil // not CLI-renamed
-		}
-		for _, f := range e.Files {
-			if f != nil && f.Size > 0 {
-				cliSizeMap[f.Size] = cliEntry{name: e.Name, hash: e.InfoHash}
-			}
-		}
-		return nil
-	})
-
-	if len(cliSizeMap) > 0 {
-		_ = m.storage.ForEach(func(e *storage.Entry) error {
-			if e.Protocol != "torrent" {
-				return nil
-			}
-			// Only target raw-named broken entries
-			if e.Name == "" || e.OriginalFilename == "" || e.Name != e.OriginalFilename {
-				return nil
-			}
-			// Check if any file size matches a CLI-renamed entry
-			for _, f := range e.Files {
-				if f == nil || f.Size == 0 {
-					continue
-				}
-				if cli, ok := cliSizeMap[f.Size]; ok {
-					m.logger.Info().
-						Str("ghost", e.Name).
-						Str("cli_entry", cli.name).
-						Msg("Ghost entry detected by file size match with CLI-renamed entry")
-					if cli.hash == e.InfoHash {
-						// Same hash — the ghost is a stale entryItem index entry for the raw
-						// name. The actual entry (keyed by hash) is the CLI-renamed version —
-						// do NOT delete it. Only remove the stale raw-name index entries.
-						_ = m.storage.DeleteEntryItemByName(e.Name)
-						_ = m.storage.DeleteEntryHealth(e.Name)
-						deleted++
-						m.logger.Info().Str("ghost", e.Name).Msg("Deleted stale raw-name entryItem index entry")
-					} else {
-						m.deleteEntryAndRDTorrent(e, &deleted)
-					}
-					return nil // done with this entry
-				}
-			}
-			return nil
-		})
-	}
 
 	// Case 3: stale raw-name entryItem keys with no backing entry row.
 	// When cli_mount renames an entry it creates a new entryItem under the new
