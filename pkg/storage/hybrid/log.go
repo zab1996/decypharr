@@ -34,7 +34,7 @@ import (
 
 const (
 	logMagic      = "HYBR"
-	logVersion    = uint32(3) // v3: added Protocol, Bad, AddedOn
+	logVersion    = uint32(4) // v4: added Tags
 	logHeaderSize = 16
 )
 
@@ -51,7 +51,8 @@ type LogRecord struct {
 	TotalSize int64
 	Protocol  string // "torrent" or "nzb"
 	Bad       bool
-	AddedOn   int64 // Unix timestamp
+	AddedOn   int64  // Unix timestamp
+	Tags      string // comma-separated tags (v4+)
 }
 
 // appendLog is an append-only log file
@@ -154,7 +155,7 @@ func (l *appendLog) validateHeader() (uint32, error) {
 }
 
 // Append writes a record to the log and returns the offset and size of the value
-func (l *appendLog) Append(key string, value []byte, deleted bool, category, provider, status, name string, totalSize int64, protocol string, bad bool, addedOn int64) (offset int64, size int32, err error) {
+func (l *appendLog) Append(key string, value []byte, deleted bool, category, provider, status, name string, totalSize int64, protocol string, bad bool, addedOn int64, tags string) (offset int64, size int32, err error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -164,6 +165,7 @@ func (l *appendLog) Append(key string, value []byte, deleted bool, category, pro
 	statusBytes := []byte(status)
 	nameBytes := []byte(name)
 	protocolBytes := []byte(protocol)
+	tagsBytes := []byte(tags)
 
 	// Calculate total record size
 	recordSize := 4 + len(keyBytes) + // keyLen + key
@@ -175,7 +177,8 @@ func (l *appendLog) Append(key string, value []byte, deleted bool, category, pro
 		2 + len(nameBytes) + // nameLen + name
 		8 + // totalSize
 		2 + len(protocolBytes) + // protocolLen + protocol
-		8 // addedOn
+		8 + // addedOn
+		2 + len(tagsBytes) // tagsLen + tags
 
 	buf := make([]byte, recordSize)
 	pos := 0
@@ -242,6 +245,12 @@ func (l *appendLog) Append(key string, value []byte, deleted bool, category, pro
 	binary.LittleEndian.PutUint64(buf[pos:], uint64(addedOn))
 	pos += 8
 
+	// Tags
+	binary.LittleEndian.PutUint16(buf[pos:], uint16(len(tagsBytes)))
+	pos += 2
+	copy(buf[pos:], tagsBytes)
+	pos += len(tagsBytes)
+
 	// Write to file
 	if _, err := l.file.WriteAt(buf, l.writePos); err != nil {
 		return 0, 0, err
@@ -294,8 +303,8 @@ func (l *appendLog) Iterate(fn func(*LogRecord) error) error {
 
 	pos := int64(logHeaderSize)
 	fileSize := l.writePos
-	var fixed [8]byte    // scratch for fixed-width fields
-	var sbuf []byte      // reused scratch for length-prefixed strings
+	var fixed [8]byte // scratch for fixed-width fields
+	var sbuf []byte   // reused scratch for length-prefixed strings
 
 	for pos < fileSize {
 		record, nextPos, err := readRecordFrom(r, pos, l.version, fixed[:], &sbuf)
@@ -431,6 +440,13 @@ func readRecordFrom(r *bufio.Reader, startPos int64, version uint32, fixed []byt
 		}
 	}
 
+	var tags string
+	if version >= 4 {
+		if tags, err = readField(); err != nil {
+			return nil, 0, err
+		}
+	}
+
 	return &LogRecord{
 		Key:       key,
 		Offset:    valueOffset,
@@ -444,6 +460,7 @@ func readRecordFrom(r *bufio.Reader, startPos int64, version uint32, fixed []byt
 		Protocol:  protocol,
 		Bad:       bad,
 		AddedOn:   addedOn,
+		Tags:      tags,
 	}, pos, nil
 }
 

@@ -2,7 +2,6 @@ package manager
 
 import (
 	"fmt"
-	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -35,6 +34,12 @@ const (
 	filterByFileCountLT   string = "file_count_lt"
 	filterByFilesRegex    string = "files_regex"
 	filterByNotFilesRegex string = "not_files_regex"
+
+	filterByTags    string = "tags"
+	filterByNotTags string = "not_tags"
+
+	filterByCategory    string = "category"
+	filterByNotCategory string = "not_category"
 )
 
 type CustomFolders struct {
@@ -83,7 +88,7 @@ func (m *Manager) GetCustomFolders() []string {
 
 // matchesFilter checks if a torrent matches all filters for a folder.
 // getFileNames is a lazy loader called only when files_regex/not_files_regex/file_count filters are needed.
-func (cf *CustomFolders) matchesFilter(folderName string, fileInfo os.FileInfo, addedTime time.Time, getFileNames func() []string) bool {
+func (cf *CustomFolders) matchesFilter(folderName string, fileInfo *FileInfo, addedTime time.Time, getFileNames func() []string) bool {
 	filters, ok := cf.filters[folderName]
 	if !ok {
 		return false
@@ -153,7 +158,7 @@ func (cf *CustomFolders) matchesFilter(folderName string, fileInfo os.FileInfo, 
 }
 
 // checkSingleFilter checks if a single filter matches
-func (cf *CustomFolders) checkSingleFilter(filter directoryFilter, fileInfo os.FileInfo, addedTime time.Time, getFileNames func() []string) bool {
+func (cf *CustomFolders) checkSingleFilter(filter directoryFilter, fileInfo *FileInfo, addedTime time.Time, getFileNames func() []string) bool {
 	name := fileInfo.Name()
 	size := fileInfo.Size()
 
@@ -202,7 +207,33 @@ func (cf *CustomFolders) checkSingleFilter(filter directoryFilter, fileInfo os.F
 			}
 		}
 		return true
+	case filterByTags:
+		return hasAnyTag(fileInfo.Tags(), filter.value)
+	case filterByNotTags:
+		return !hasAnyTag(fileInfo.Tags(), filter.value)
+	case filterByCategory:
+		return strings.EqualFold(fileInfo.Category(), filter.value)
+	case filterByNotCategory:
+		return !strings.EqualFold(fileInfo.Category(), filter.value)
 	default:
 		return false
 	}
+}
+
+// hasAnyTag reports whether entryTags contains any of the comma-separated
+// tags in filterValue (case-insensitive).
+func hasAnyTag(entryTags []string, filterValue string) bool {
+	wanted := strings.Split(filterValue, ",")
+	for _, w := range wanted {
+		w = strings.TrimSpace(w)
+		if w == "" {
+			continue
+		}
+		for _, t := range entryTags {
+			if strings.EqualFold(strings.TrimSpace(t), w) {
+				return true
+			}
+		}
+	}
+	return false
 }

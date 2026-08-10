@@ -342,10 +342,40 @@ func (q *QBit) handleAddTorrentTags(w http.ResponseWriter, r *http.Request) {
 	for i, tag := range tags {
 		tags[i] = strings.TrimSpace(tag)
 	}
-	torrents := q.manager.Queue().ListFilter("", config.ProtocolTorrent, "", hashes, "", false)
+	// ProtocolAll — tags apply to both torrent and NZB entries, not just torrents.
+	// The queue store (active/downloading items) and the entries store (the
+	// permanent record /api/browse and /api/sync/changes read from) are two
+	// independent storage engines. An entry can exist in either or both, so
+	// tags must be written to BOTH stores whenever present, or one view goes
+	// stale while the other shows the tag correctly.
+	torrents := q.manager.Queue().ListFilter("", config.ProtocolAll, "", hashes, "", false)
+	matched := make(map[string]bool, len(torrents))
 	for _, t := range torrents {
+		matched[strings.ToLower(t.InfoHash)] = true
 		q.setTorrentTags(t, tags)
 	}
+	for _, h := range hashes {
+		lh := strings.ToLower(h)
+		entry, err := q.manager.GetEntry(lh)
+		if err != nil || entry == nil {
+			continue
+		}
+		matched[lh] = true
+		for _, tag := range tags {
+			if tag != "" && !utils.Contains(entry.Tags, tag) {
+				entry.Tags = append(entry.Tags, tag)
+			}
+		}
+		_ = q.manager.AddOrUpdate(entry, nil)
+	}
+	if len(matched) == 0 {
+		http.Error(w, "no matching torrents found for given hashes", http.StatusNotFound)
+		return
+	}
+	// Tag mutations don't change the mount's file layout, only metadata the
+	// entry cache has already snapshotted — drop the cache so /api/browse
+	// and /api/sync/changes reflect the new tags on next read.
+	q.manager.RefreshEntries(false)
 	utils.JSONResponse(w, nil, http.StatusOK)
 }
 
@@ -361,11 +391,32 @@ func (q *QBit) handleRemoveTorrentTags(w http.ResponseWriter, r *http.Request) {
 	for i, tag := range tags {
 		tags[i] = strings.TrimSpace(tag)
 	}
-	torrents := q.manager.Queue().ListFilter("", config.ProtocolTorrent, "", hashes, "", false)
+	// ProtocolAll — tags apply to both torrent and NZB entries, not just torrents.
+	// See handleAddTorrentTags: queue and entries are separate stores, so
+	// removal must be applied to both whenever the hash exists in either.
+	torrents := q.manager.Queue().ListFilter("", config.ProtocolAll, "", hashes, "", false)
+	matched := make(map[string]bool, len(torrents))
 	for _, torrent := range torrents {
+		matched[strings.ToLower(torrent.InfoHash)] = true
 		q.removeTorrentTags(torrent, tags)
-
 	}
+	for _, h := range hashes {
+		lh := strings.ToLower(h)
+		entry, err := q.manager.GetEntry(lh)
+		if err != nil || entry == nil {
+			continue
+		}
+		matched[lh] = true
+		entry.Tags = utils.RemoveItem(entry.Tags, tags...)
+		_ = q.manager.AddOrUpdate(entry, nil)
+	}
+	if len(matched) == 0 {
+		http.Error(w, "no matching torrents found for given hashes", http.StatusNotFound)
+		return
+	}
+	// See handleAddTorrentTags — the entry cache must be invalidated for
+	// removed tags to be reflected in subsequent /api/browse reads.
+	q.manager.RefreshEntries(false)
 	utils.JSONResponse(w, nil, http.StatusOK)
 }
 

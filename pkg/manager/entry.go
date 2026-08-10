@@ -33,8 +33,10 @@ type FileInfo struct {
 	canDelete    bool
 	byteRange    *[2]int64
 	infohash     string
-	sidecarPath  string     // path on disk for sidecar files (subtitles etc.)
+	sidecarPath  string      // path on disk for sidecar files (subtitles etc.)
 	sys          interface{} // For caching fuse nodes
+	category     string
+	tags         []string
 }
 
 func (f *FileInfo) Name() string         { return f.name }
@@ -53,6 +55,8 @@ func (f *FileInfo) SidecarPath() string  { return f.sidecarPath }
 func (f *FileInfo) IsSidecar() bool      { return f.sidecarPath != "" }
 func (f *FileInfo) ByteRange() *[2]int64 { return f.byteRange }
 func (f *FileInfo) InfoHash() string     { return f.infohash }
+func (f *FileInfo) Category() string     { return f.category }
+func (f *FileInfo) Tags() []string       { return f.tags }
 
 // GetTorrentMountPath returns the full mount path for a torrent
 // Returns the path based on the new unified mount structure
@@ -240,6 +244,8 @@ func (m *Manager) getEntryChildren(group string) (*FileInfo, []FileInfo) {
 				isDir:        true,
 				activeDebrid: meta.Provider,
 				canDelete:    true,
+				category:     meta.Category,
+				tags:         meta.Tags,
 			})
 			return nil
 		})
@@ -265,6 +271,8 @@ func (m *Manager) getEntryChildren(group string) (*FileInfo, []FileInfo) {
 					isDir:        true,
 					activeDebrid: meta.Provider,
 					canDelete:    true,
+					category:     meta.Category,
+					tags:         meta.Tags,
 				})
 			}
 			return nil
@@ -291,6 +299,8 @@ func (m *Manager) getEntryChildren(group string) (*FileInfo, []FileInfo) {
 					isDir:        true,
 					activeDebrid: meta.Provider,
 					canDelete:    true,
+					category:     meta.Category,
+					tags:         meta.Tags,
 				})
 			}
 			return nil
@@ -317,6 +327,8 @@ func (m *Manager) getEntryChildren(group string) (*FileInfo, []FileInfo) {
 					isDir:        true,
 					activeDebrid: meta.Provider,
 					canDelete:    true,
+					category:     meta.Category,
+					tags:         meta.Tags,
 				})
 			}
 			return nil
@@ -349,6 +361,8 @@ func (m *Manager) getEntryChildren(group string) (*FileInfo, []FileInfo) {
 						isDir:        true,
 						activeDebrid: meta.Provider,
 						canDelete:    true,
+						category:     meta.Category,
+						tags:         meta.Tags,
 					})
 				}
 				return nil
@@ -547,8 +561,10 @@ func (m *Manager) getCustomFolderChildren(folder string) []FileInfo {
 			return names
 		}
 		if m.customFolders.matchesFilter(folder, &FileInfo{
-			name: meta.Name,
-			size: meta.Size,
+			name:     meta.Name,
+			size:     meta.Size,
+			category: meta.Category,
+			tags:     meta.Tags,
 		}, meta.AddedOn, getFileNames) {
 			if _, ok := seen[meta.Name]; ok {
 				return nil
@@ -562,6 +578,8 @@ func (m *Manager) getCustomFolderChildren(folder string) []FileInfo {
 				isDir:        true,
 				activeDebrid: meta.Provider,
 				canDelete:    true,
+				category:     meta.Category,
+				tags:         meta.Tags,
 			})
 		}
 		return nil

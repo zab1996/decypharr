@@ -33,6 +33,7 @@ func (s *Storage) AddOrUpdate(entry *Entry) error {
 		Protocol:  string(entry.Protocol),
 		Bad:       entry.Bad,
 		AddedOn:   entry.AddedOn.Unix(),
+		Tags:      strings.Join(entry.Tags, ","),
 	}
 
 	return s.entries.Put(entry.InfoHash, data, meta)
@@ -140,12 +141,18 @@ type EntryMetaInfo struct {
 	Provider string
 	Protocol string
 	Bad      bool
+	Category string
+	Tags     []string
 }
 
 // ForEachMeta iterates over entry metadata without reading full entries from disk.
 // This is O(n) in-memory only - no disk reads, no protobuf deserialization.
 func (s *Storage) ForEachMeta(fn func(*EntryMetaInfo) error) error {
 	return s.entries.ForEachMeta(func(key string, meta *hybrid.IndexEntry) error {
+		var tags []string
+		if meta.Tags != "" {
+			tags = strings.Split(meta.Tags, ",")
+		}
 		return fn(&EntryMetaInfo{
 			InfoHash: key,
 			Name:     meta.Name,
@@ -154,6 +161,8 @@ func (s *Storage) ForEachMeta(fn func(*EntryMetaInfo) error) error {
 			Provider: meta.Provider,
 			Protocol: meta.Protocol,
 			Bad:      meta.Bad,
+			Category: meta.Category,
+			Tags:     tags,
 		})
 	})
 }
@@ -381,6 +390,7 @@ func (s *Storage) UpdateQueue(entry *Entry) error {
 		Protocol:  string(entry.Protocol),
 		Bad:       entry.Bad,
 		AddedOn:   entry.AddedOn.Unix(),
+		Tags:      strings.Join(entry.Tags, ","),
 	}
 
 	return s.queue.Put(strings.ToLower(entry.InfoHash), data, meta)

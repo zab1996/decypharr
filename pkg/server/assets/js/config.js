@@ -1615,6 +1615,47 @@ class ConfigManager {
     }
 
     // Virtual Folders Management
+
+    // Every filter type recognized by the backend (pkg/manager/custom_folders.go).
+    // Keep this list in sync with that file's filterBy* constants.
+    static VIRTUAL_FOLDER_FILTER_TYPES = [
+        {value: 'include', label: 'Include (name contains)'},
+        {value: 'exclude', label: 'Exclude (name does not contain)'},
+        {value: 'starts_with', label: 'Starts with'},
+        {value: 'ends_with', label: 'Ends with'},
+        {value: 'not_starts_with', label: 'Not starts with'},
+        {value: 'not_ends_with', label: 'Not ends with'},
+        {value: 'regex', label: 'Regex (name matches)'},
+        {value: 'not_regex', label: 'Regex (name does not match)'},
+        {value: 'exact_match', label: 'Exact match (name)'},
+        {value: 'not_exact_match', label: 'Not exact match (name)'},
+        {value: 'size_gt', label: 'Size greater than'},
+        {value: 'size_lt', label: 'Size less than'},
+        {value: 'last_added', label: 'Added within (duration)'},
+        {value: 'file_count_gt', label: 'File count greater than'},
+        {value: 'file_count_lt', label: 'File count less than'},
+        {value: 'files_regex', label: 'Regex (any file name matches)'},
+        {value: 'not_files_regex', label: 'Regex (no file name matches)'},
+        {value: 'tags', label: 'Has tag (any of, comma-separated)'},
+        {value: 'not_tags', label: 'Does not have tag (any of, comma-separated)'},
+        {value: 'category', label: 'Category equals'},
+        {value: 'not_category', label: 'Category does not equal'},
+    ];
+
+    // Builds the <select> for a filter-key row. If `selectedKey` isn't one of the
+    // known types (e.g. saved by an older/external client), it's injected as an
+    // extra option so the existing value is preserved instead of silently dropped.
+    renderVirtualFolderFilterKeySelect(name, selectedKey = '') {
+        const known = ConfigManager.VIRTUAL_FOLDER_FILTER_TYPES;
+        const isKnown = !selectedKey || known.some(opt => opt.value === selectedKey);
+        const options = [
+            `<option value="" ${selectedKey ? '' : 'selected'} disabled>Select a filter...</option>`,
+            !isKnown ? `<option value="${window.decypharrUtils.escapeHtml(selectedKey)}" selected>${window.decypharrUtils.escapeHtml(selectedKey)} (unrecognized)</option>` : '',
+            ...known.map(opt => `<option value="${opt.value}" ${opt.value === selectedKey ? 'selected' : ''}>${opt.label}</option>`),
+        ].join('');
+        return `<select class="select select-bordered select-sm flex-1" name="${name}">${options}</select>`;
+    }
+
     populateVirtualFolders(customFolders) {
         if (!customFolders) return;
 
@@ -1661,11 +1702,7 @@ class ConfigManager {
                             <div class="space-y-2" id="virtual_folder_${id}_filters">
                                 ${filterEntries.length > 0 ? filterEntries.map(([key, value], index) => `
                                     <div class="flex gap-2" data-filter-index="${index}">
-                                        <input type="text"
-                                               class="input input-bordered input-sm flex-1"
-                                               name="virtual_folder_${id}_filter_key_${index}"
-                                               value="${window.decypharrUtils.escapeHtml(key)}"
-                                               placeholder="Filter key (e.g., name, category)">
+                                        ${this.renderVirtualFolderFilterKeySelect(`virtual_folder_${id}_filter_key_${index}`, key)}
                                         <input type="text"
                                                class="input input-bordered input-sm flex-1"
                                                name="virtual_folder_${id}_filter_value_${index}"
@@ -1702,10 +1739,7 @@ class ConfigManager {
 
         const filterHtml = `
             <div class="flex gap-2" data-filter-index="${newIndex}">
-                <input type="text"
-                       class="input input-bordered input-sm flex-1"
-                       name="virtual_folder_${folderId}_filter_key_${newIndex}"
-                       placeholder="Filter key (e.g., name, category)">
+                ${this.renderVirtualFolderFilterKeySelect(`virtual_folder_${folderId}_filter_key_${newIndex}`)}
                 <input type="text"
                        class="input input-bordered input-sm flex-1"
                        name="virtual_folder_${folderId}_filter_value_${newIndex}"

@@ -203,6 +203,7 @@ func (s *Store) recover() error {
 				Protocol:  record.Protocol,
 				Bad:       record.Bad,
 				AddedOn:   record.AddedOn,
+				Tags:      record.Tags,
 			})
 		}
 		return nil
@@ -268,7 +269,7 @@ func (s *Store) Put(key string, value []byte, meta *EntryMeta) error {
 	defer s.mu.Unlock()
 
 	// Prepare metadata
-	var category, provider, name, status, protocol string
+	var category, provider, name, status, protocol, tags string
 	var totalSize, addedOn int64
 	var bad bool
 	if meta != nil {
@@ -280,10 +281,11 @@ func (s *Store) Put(key string, value []byte, meta *EntryMeta) error {
 		protocol = meta.Protocol
 		bad = meta.Bad
 		addedOn = meta.AddedOn
+		tags = meta.Tags
 	}
 
 	// Write to log
-	offset, size, err := s.log.Append(key, value, false, category, provider, status, name, totalSize, protocol, bad, addedOn)
+	offset, size, err := s.log.Append(key, value, false, category, provider, status, name, totalSize, protocol, bad, addedOn, tags)
 	if err != nil {
 		return fmt.Errorf("failed to append to log: %w", err)
 	}
@@ -300,6 +302,7 @@ func (s *Store) Put(key string, value []byte, meta *EntryMeta) error {
 		Protocol:  protocol,
 		Bad:       bad,
 		AddedOn:   addedOn,
+		Tags:      tags,
 	})
 
 	// Invalidate cache (will be populated on next read)
@@ -381,7 +384,7 @@ func (s *Store) Delete(key string) error {
 	}
 
 	// Write tombstone to log
-	if _, _, err := s.log.Append(key, nil, true, "", "", "", "", 0, "", false, 0); err != nil {
+	if _, _, err := s.log.Append(key, nil, true, "", "", "", "", 0, "", false, 0, ""); err != nil {
 		return fmt.Errorf("failed to write tombstone: %w", err)
 	}
 
@@ -558,7 +561,7 @@ func (s *Store) Compact() error {
 		}
 
 		// Write to new log
-		offset, size, err := newLog.Append(key, value, false, entry.Category, entry.Provider, entry.Status, entry.Name, entry.TotalSize, entry.Protocol, entry.Bad, entry.AddedOn)
+		offset, size, err := newLog.Append(key, value, false, entry.Category, entry.Provider, entry.Status, entry.Name, entry.TotalSize, entry.Protocol, entry.Bad, entry.AddedOn, entry.Tags)
 		if err != nil {
 			_ = newLog.Close()
 			_ = os.Remove(newLogPath)
@@ -577,6 +580,7 @@ func (s *Store) Compact() error {
 			Protocol:  entry.Protocol,
 			Bad:       entry.Bad,
 			AddedOn:   entry.AddedOn,
+			Tags:      entry.Tags,
 		})
 	}
 
@@ -640,5 +644,6 @@ type EntryMeta struct {
 	TotalSize int64
 	Protocol  string // "torrent" or "nzb"
 	Bad       bool
-	AddedOn   int64 // Unix timestamp
+	AddedOn   int64  // Unix timestamp
+	Tags      string // comma-separated tags
 }

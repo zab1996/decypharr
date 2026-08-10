@@ -312,6 +312,40 @@ class FileBrowser {
         return `<span class="badge ${cls} badge-sm" title="${this.escapeAttr(tooltip)}">${this.escapeHtml(state.status || 'unknown')}</span>`;
     }
 
+    tagBadges(tags, infoHash) {
+        if (!tags || !tags.length) return '';
+        return tags.map(tag => `
+            <span onclick="event.stopPropagation();"
+                  style="display:inline-flex;align-items:center;gap:6px;margin-left:6px;padding:3px 10px;
+                         border-radius:9999px;font-size:12px;line-height:1.4;font-weight:500;
+                         color:#fff;background:#7a4a35;white-space:nowrap;vertical-align:middle;">
+                ${this.escapeHtml(tag)}
+                <span onclick="window.fileBrowser.removeTag('${this.escapeJs(infoHash || '')}', '${this.escapeJs(tag)}');"
+                      title="Remove tag"
+                      style="cursor:pointer;font-weight:700;">&times;</span>
+            </span>
+        `).join('');
+    }
+
+    async removeTag(infoHash, tag) {
+        if (!infoHash) {
+            window.createToast?.('Cannot remove tag: entry has no info hash', 'error');
+            return;
+        }
+        try {
+            const resp = await fetch('/api/v2/torrents/removeTags', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                body: `hashes=${encodeURIComponent(infoHash)}&tags=${encodeURIComponent(tag)}`,
+            });
+            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+            window.createToast?.(`Removed tag "${tag}"`, 'success');
+            this.loadEntries();
+        } catch (err) {
+            window.createToast?.(`Failed to remove tag: ${err.message}`, 'error');
+        }
+    }
+
     async recheckEntry(name) {
         try {
             window.createToast?.(`Rechecking ${name}…`, 'info');
@@ -392,6 +426,7 @@ class FileBrowser {
                     <td>${icon}</td>
                     <td onclick="window.fileBrowser.handleEntryClick('${this.escapeJs(entry.path)}', ${entry.is_dir}, '${this.escapeJs(entry.name)}');" class="cursor-pointer hover:text-primary transition-colors">
                         <span class="font-medium">${this.escapeHtml(entry.name)}</span>
+                        ${this.tagBadges(entry.tags, entry.info_hash)}
                     </td>
                     <td>
                         ${entry.size <= 0 ? '-' : this.formatSize(entry.size)}

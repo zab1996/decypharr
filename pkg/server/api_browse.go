@@ -20,14 +20,15 @@ import (
 
 // BrowseEntry represents a file or folder in the browse view
 type BrowseEntry struct {
-	Name         string `json:"name"`
-	Path         string `json:"path"`
-	Size         int64  `json:"size"`
-	ModTime      string `json:"mod_time"`
-	IsDir        bool   `json:"is_dir"`
-	InfoHash     string `json:"info_hash,omitempty"`
-	CanDelete    bool   `json:"can_delete,omitempty"`
-	ActiveDebrid string `json:"active_debrid"`
+	Name         string   `json:"name"`
+	Path         string   `json:"path"`
+	Size         int64    `json:"size"`
+	ModTime      string   `json:"mod_time"`
+	IsDir        bool     `json:"is_dir"`
+	InfoHash     string   `json:"info_hash,omitempty"`
+	CanDelete    bool     `json:"can_delete,omitempty"`
+	ActiveDebrid string   `json:"active_debrid"`
+	Tags         []string `json:"tags,omitempty"`
 }
 
 // BrowseResponse is the response for browse requests
@@ -203,6 +204,7 @@ func (s *Server) handleBrowseGroup(w http.ResponseWriter, r *http.Request) {
 			InfoHash:     child.InfoHash(),
 			CanDelete:    canDelete,
 			ActiveDebrid: child.ActiveDebrid(),
+			Tags:         child.Tags(),
 		})
 	}
 	sortBrowseEntries(entries, sortBy, sortOrder)

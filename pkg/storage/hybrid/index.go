@@ -22,7 +22,8 @@ type IndexEntry struct {
 	TotalSize int64
 	Protocol  string // "torrent" or "nzb"
 	Bad       bool
-	AddedOn   int64 // Unix timestamp
+	AddedOn   int64  // Unix timestamp
+	Tags      string // comma-separated tags
 }
 
 // Index is the in-memory index with secondary indexes for fast filtering
@@ -40,7 +41,6 @@ type Index struct {
 	sortedKeys  []string
 	sortedDirty bool
 }
-
 
 // newIndex creates a new empty index
 func newIndex() *Index {
