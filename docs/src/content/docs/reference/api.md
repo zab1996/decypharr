@@ -194,6 +194,28 @@ curl -X POST \
   http://localhost:8282/api/repair/recheck/media
 ```
 
+### POST /api/repair/replacements/verify
+
+Verify one exact registered NZB replacement. The normal article/segment check runs
+before bounded mounted reads and `ffprobe` validation.
+
+```bash
+curl -X POST -H "Authorization: Bearer TOKEN" -H "Content-Type: application/json" \
+  -d '{"cli_debrid_id":75299,"info_hash":"NEW_NZB_UUID"}' \
+  http://localhost:8282/api/repair/replacements/verify
+```
+
+### POST /api/repair/replacements/ack
+
+Idempotently remove one exact old broken file after a healthy replacement is confirmed.
+The old health record, UUID, filename, reason, and registered cli_debrid ID must match.
+
+```bash
+curl -X POST -H "Authorization: Bearer TOKEN" -H "Content-Type: application/json" \
+  -d '{"entry_name":"Old.Release","file_name":"episode.mkv","info_hash":"OLD_NZB_UUID","cli_debrid_id":75299,"reason":"media_probe_failed"}' \
+  http://localhost:8282/api/repair/replacements/ack
+```
+
 ### GET /api/arrs
 
 List connected Arrs.

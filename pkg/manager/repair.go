@@ -48,6 +48,35 @@ type ClearRepairStateResult struct {
 	Cleared  int                    `json:"cleared"`
 }
 
+type ReplacementVerifyRequest struct {
+	CliDebridID int64  `json:"cli_debrid_id"`
+	InfoHash    string `json:"info_hash"`
+}
+
+type ReplacementVerifyResult struct {
+	Status    string `json:"status"`
+	Reason    string `json:"reason,omitempty"`
+	EntryName string `json:"entry_name,omitempty"`
+	FileName  string `json:"file_name,omitempty"`
+}
+
+type ReplacementAckRequest struct {
+	EntryName   string `json:"entry_name"`
+	FileName    string `json:"file_name"`
+	InfoHash    string `json:"info_hash"`
+	CliDebridID int64  `json:"cli_debrid_id"`
+	Reason      string `json:"reason"`
+}
+
+type ReplacementAckResult struct {
+	Status       string `json:"status"`
+	EntryDeleted bool   `json:"entry_deleted"`
+}
+
+type ReplacementAckError struct{ Code, Message string }
+
+func (e *ReplacementAckError) Error() string { return e.Message }
+
 const (
 	repairSchedulerTag     = "repair-sweep"
 	repairStopSchedulerTag = "repair-sweep-stop"
@@ -65,28 +94,34 @@ const (
 
 // Repair is the health-check / auto-repair service. One instance per Manager.
 type Repair struct {
-	manager   *Manager
-	scheduler gocron.Scheduler
-	logger    zerolog.Logger
+	manager             *Manager
+	scheduler           gocron.Scheduler
+	logger              zerolog.Logger
+	mediaProbeSlots     chan struct{}
+	mediaProbeAttempt   func(context.Context, string) mediaProbeResult
+	replacementNZBProbe func(context.Context, *storage.Entry, string, fileResult) fileResult
 
-	mu             sync.Mutex
-	parentCtx      context.Context
-	activeRunID    string
-	cancelRun      context.CancelFunc
-	scheduled      bool
-	stopScheduled  bool
-	activeStopFunc func() // called by the stop job for the active run
-	runWG          sync.WaitGroup
+	mu                  sync.Mutex
+	parentCtx           context.Context
+	activeRunID         string
+	activeVerifications int
+	cancelRun           context.CancelFunc
+	scheduled           bool
+	stopScheduled       bool
+	activeStopFunc      func() // called by the stop job for the active run
+	runWG               sync.WaitGroup
 }
 
 // NewRepair builds the repair service for the given manager. Call
 // Repair.Start to register the recurring sweep with the scheduler.
 func NewRepair(m *Manager) *Repair {
 	return &Repair{
-		manager:   m,
-		scheduler: m.scheduler,
-		logger:    logger.New("repair"),
-		parentCtx: context.Background(),
+		manager:           m,
+		scheduler:         m.scheduler,
+		logger:            logger.New("repair"),
+		parentCtx:         context.Background(),
+		mediaProbeSlots:   make(chan struct{}, repairMediaProbeConcurrency),
+		mediaProbeAttempt: runMountedMediaProbeAttempt,
 	}
 }
 
@@ -439,6 +474,10 @@ func (r *Repair) runSweep(trigger storage.RepairRunTrigger, opts RepairRunOption
 	}
 
 	r.mu.Lock()
+	if r.activeVerifications > 0 {
+		r.mu.Unlock()
+		return "", errors.New("repair already running (replacement verification active)")
+	}
 	if r.activeRunID != "" {
 		id := r.activeRunID
 		r.mu.Unlock()
