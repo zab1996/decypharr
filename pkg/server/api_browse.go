@@ -325,6 +325,13 @@ func (s *Server) handleDeleteBrowseTorrent(w http.ResponseWriter, r *http.Reques
 	}
 
 	if err := s.manager.DeleteEntry(id, true); err != nil {
+		// An entry that's already gone isn't a delete failure — callers
+		// (e.g. cli_debrid's exact-cleanup retry loop) need a 404 here to
+		// treat it as done rather than retrying an unrecoverable 500 forever.
+		if strings.Contains(strings.ToLower(err.Error()), "not found") {
+			http.Error(w, "Torrent not found", http.StatusNotFound)
+			return
+		}
 		s.logger.Error().Err(err).Str("id", id).Msg("Failed to delete entry")
 		http.Error(w, "Failed to delete entry", http.StatusInternalServerError)
 		return

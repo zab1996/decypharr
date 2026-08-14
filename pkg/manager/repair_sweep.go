@@ -1356,6 +1356,18 @@ func (r *Repair) AcknowledgeReplacement(req ReplacementAckRequest) (*Replacement
 		return &ReplacementAckResult{Status: "already_removed"}, nil
 	}
 	if file.InfoHash != req.InfoHash {
+		// The (entry_name, file_name) slot was already overwritten in place by
+		// updateEntryItem when the replacement registered — normal for a
+		// same-named episode — well before this cleanup ack could arrive. If
+		// the file now sitting there is confirmed to be the exact replacement
+		// this repair verified, the old file is already superseded rather
+		// than genuinely stale: acknowledge it and reclaim the orphaned old
+		// provider entry instead of looping forever on stale_target.
+		if r.oldFileSupersededByVerifiedReplacement(req, file) {
+			r.clearAcknowledgedHealth(req)
+			r.deleteOrphanedProviderEntry(req.InfoHash)
+			return &ReplacementAckResult{Status: "already_removed"}, nil
+		}
 		return nil, &ReplacementAckError{Code: "stale_target", Message: "mounted file source changed"}
 	}
 	health, _ := r.manager.storage.GetEntryHealth(req.EntryName)
@@ -1418,6 +1430,31 @@ func (r *Repair) AcknowledgeReplacement(req ReplacementAckRequest) (*Replacement
 		status = "already_removed"
 	}
 	return &ReplacementAckResult{Status: status, EntryDeleted: entryDeleted}, nil
+}
+
+// oldFileSupersededByVerifiedReplacement reports whether the file currently
+// registered at req's (entry_name, file_name) is the exact replacement this
+// repair verified and registered, rather than an unrelated file that happens
+// to share the name.
+func (r *Repair) oldFileSupersededByVerifiedReplacement(req ReplacementAckRequest, current *storage.File) bool {
+	if current == nil || current.Deleted {
+		return false
+	}
+	entry, err := r.manager.GetEntry(current.InfoHash)
+	if err != nil || entry == nil {
+		return false
+	}
+	return entry.CliDebridIDs[req.FileName] == req.CliDebridID
+}
+
+// deleteOrphanedProviderEntry best-effort removes the old provider entry left
+// behind when its (entry_name, file_name) slot was overwritten in place by a
+// replacement before exact cleanup could run against it by name. Absence is
+// not an error — the entry may already be gone.
+func (r *Repair) deleteOrphanedProviderEntry(infoHash string) {
+	if err := r.manager.DeleteEntry(infoHash, true); err != nil {
+		r.logger.Debug().Err(err).Str("infohash", infoHash).Msg("AcknowledgeReplacement: orphaned old provider entry already gone")
+	}
 }
 
 func (r *Repair) clearAcknowledgedHealth(req ReplacementAckRequest) {
