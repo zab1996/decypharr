@@ -475,7 +475,8 @@ func (r *Repair) probeNZBFile(ctx context.Context, entry *storage.Entry, name st
 		res.healthy = true
 		return res
 	}
-	if errors.Is(err, customerror.UsenetSegmentMissingError) {
+	var customErr *customerror.Error
+	if errors.Is(err, customerror.UsenetSegmentMissingError) || (errors.As(err, &customErr) && customErr.IsPermanent()) {
 		res.broken = true
 		res.reason = "usenet_segment_missing"
 	} else {
