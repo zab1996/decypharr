@@ -1413,8 +1413,20 @@ func (r *Repair) AcknowledgeReplacement(req ReplacementAckRequest) (*Replacement
 	}
 	entry, entryErr := r.manager.GetEntry(req.InfoHash)
 	providerMissing := entryErr != nil || entry == nil
-	if !providerMissing && entry.CliDebridIDs[req.FileName] != req.CliDebridID {
-		return nil, &ReplacementAckError{Code: "stale_target", Message: "mounted registration changed"}
+	if !providerMissing {
+		// The entry-item lookup above and the health-record match already
+		// independently confirmed (by exact name, hash, and cli_debrid_id)
+		// that this is the right file — this per-hash torrent-index record
+		// is a third, more easily stale source, prone to drifting out of
+		// sync with the entry-item store it's meant to mirror. Only an
+		// actual reassignment to a different, non-zero cli_debrid_id is
+		// real evidence something else has claimed this slot; an empty or
+		// unset registration here is just this record being orphaned, not
+		// a reason to keep blocking a deletion two other checks already
+		// vouched for.
+		if registeredID, ok := entry.CliDebridIDs[req.FileName]; ok && registeredID != 0 && registeredID != req.CliDebridID {
+			return nil, &ReplacementAckError{Code: "stale_target", Message: "mounted registration changed"}
+		}
 	}
 	active := 0
 	for _, candidate := range item.Files {

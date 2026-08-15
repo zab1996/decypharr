@@ -2,6 +2,7 @@ package manager
 
 import (
 	"context"
+	"errors"
 	"os"
 	"testing"
 	"time"
@@ -171,6 +172,111 @@ func TestAcknowledgeReplacementReclaimsSupersededSlot(t *testing.T) {
 		if broken.InfoHash == "old-uuid" {
 			t.Fatalf("expected old broken-health record to be cleared, still present: %#v", broken)
 		}
+	}
+}
+
+func TestAcknowledgeReplacementProceedsWhenIndexRegistrationOrphaned(t *testing.T) {
+	store, err := storage.NewStorage(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	old := &storage.Entry{
+		Protocol: config.ProtocolNZB,
+		InfoHash: "old-uuid",
+		Name:     "Old.Release",
+		Files: map[string]*storage.File{
+			"episode.mkv": {Name: "episode.mkv", InfoHash: "old-uuid", Size: 100},
+		},
+		// The per-hash torrent-index record's registration is empty — desynced
+		// from the entry-item store, as happens in production when this
+		// record drifts out of the torrent listing while the entry-item
+		// (and its health record) remain correct.
+		CliDebridIDs: map[string]int64{},
+	}
+	if err := store.AddOrUpdate(old); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveEntryHealth(&storage.EntryHealth{
+		EntryName: "Old.Release", Protocol: config.ProtocolNZB, Status: storage.HealthBroken,
+		BrokenFiles: []storage.BrokenFile{{
+			EntryName: "Old.Release", FileName: "episode.mkv", InfoHash: "old-uuid",
+			Protocol: config.ProtocolNZB, CliDebridID: 55, Reason: "media_probe_failed",
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	mgr := &Manager{storage: store, config: config.Get()}
+	mgr.initEntryCache()
+	repair := &Repair{manager: mgr}
+	result, err := repair.AcknowledgeReplacement(ReplacementAckRequest{
+		EntryName: "Old.Release", FileName: "episode.mkv", InfoHash: "old-uuid",
+		CliDebridID: 55, Reason: "media_probe_failed",
+	})
+	if err != nil {
+		t.Fatalf("expected orphaned index registration not to block deletion, got err=%v", err)
+	}
+	if result.Status != "removed" {
+		t.Fatalf("result = %#v", result)
+	}
+	// This was the only file in the entry, so the whole entry is removed,
+	// not just marked deleted.
+	if _, err := store.GetEntryItem("Old.Release"); err == nil {
+		t.Fatal("expected entry to be fully removed after its last file was deleted")
+	}
+}
+
+func TestAcknowledgeReplacementStillBlocksOnGenuineReassignment(t *testing.T) {
+	store, err := storage.NewStorage(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	old := &storage.Entry{
+		Protocol: config.ProtocolNZB,
+		InfoHash: "old-uuid",
+		Name:     "Old.Release",
+		Files: map[string]*storage.File{
+			"episode.mkv": {Name: "episode.mkv", InfoHash: "old-uuid", Size: 100},
+		},
+		// Registered to a *different*, non-zero cli_debrid_id — genuine
+		// evidence something else has claimed this slot, unlike an empty
+		// registration. This must keep blocking as stale_target.
+		CliDebridIDs: map[string]int64{"episode.mkv": 999},
+	}
+	if err := store.AddOrUpdate(old); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveEntryHealth(&storage.EntryHealth{
+		EntryName: "Old.Release", Protocol: config.ProtocolNZB, Status: storage.HealthBroken,
+		BrokenFiles: []storage.BrokenFile{{
+			EntryName: "Old.Release", FileName: "episode.mkv", InfoHash: "old-uuid",
+			Protocol: config.ProtocolNZB, CliDebridID: 55, Reason: "media_probe_failed",
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	mgr := &Manager{storage: store, config: config.Get()}
+	mgr.initEntryCache()
+	repair := &Repair{manager: mgr}
+	_, err = repair.AcknowledgeReplacement(ReplacementAckRequest{
+		EntryName: "Old.Release", FileName: "episode.mkv", InfoHash: "old-uuid",
+		CliDebridID: 55, Reason: "media_probe_failed",
+	})
+	var ackErr *ReplacementAckError
+	if !errors.As(err, &ackErr) || ackErr.Code != "stale_target" {
+		t.Fatalf("expected stale_target for genuine reassignment, got err=%v", err)
+	}
+	item, err := store.GetEntryItem("Old.Release")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if item.Files["episode.mkv"].Deleted {
+		t.Fatal("file must not be deleted while genuinely reassigned")
 	}
 }
 
