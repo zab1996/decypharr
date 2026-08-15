@@ -641,6 +641,71 @@ func (r *Repair) saveHealth(state *storage.EntryHealth) {
 	}
 }
 
+// RecordLiveReadFailure marks a single file broken immediately off a real
+// mounted read failure (Plex/Bazarr/etc hitting the file), instead of
+// waiting for the next repair sweep to independently rediscover it. Scoped
+// to NZB entries, matching the rest of the minimal playback-repair workflow.
+//
+// The FUSE read path only ever sees a generic EIO — the kernel errno
+// boundary erases the original error — so this re-derives the reason using
+// the same permanent-usenet-failure check the sweep already relies on
+// (checkPermanentUsenetFailure), rather than trying to infer it from the
+// read error itself.
+func (r *Repair) RecordLiveReadFailure(infoHash, entryName, fileName string, size int64) {
+	if infoHash == "" || entryName == "" || fileName == "" {
+		return
+	}
+	entry, err := r.manager.GetEntry(infoHash)
+	if err != nil || entry == nil || !entry.IsNZB() {
+		return
+	}
+
+	reason := "media_probe_failed"
+	if r.manager.usenet != nil {
+		if permErr := r.manager.usenet.IsFilePermanentlyFailed(infoHash, fileName); permErr != nil {
+			reason = "usenet_segment_missing"
+		}
+	}
+
+	h, _ := r.manager.storage.GetEntryHealth(entryName)
+	if h == nil {
+		h = &storage.EntryHealth{EntryName: entryName, Protocol: entry.Protocol}
+	}
+	// A broken file under active playback can fail many chunked reads in a
+	// single attempt; skip the write if this exact failure is already
+	// recorded rather than re-persisting identical state on every read.
+	for _, bf := range h.BrokenFiles {
+		if bf.FileName == fileName && bf.InfoHash == infoHash && bf.Reason == reason {
+			return
+		}
+	}
+	remaining := make([]storage.BrokenFile, 0, len(h.BrokenFiles)+1)
+	for _, bf := range h.BrokenFiles {
+		if bf.FileName == fileName && bf.InfoHash == infoHash {
+			continue
+		}
+		remaining = append(remaining, bf)
+	}
+	remaining = append(remaining, storage.BrokenFile{
+		EntryName: entryName, FileName: fileName, InfoHash: infoHash,
+		Protocol: entry.Protocol, CliDebridID: entry.CliDebridIDs[fileName],
+		Reason: reason, Size: size,
+	})
+
+	now := time.Now()
+	h.Status = storage.HealthBroken
+	h.BrokenFiles = remaining
+	h.BrokenCount = len(remaining)
+	h.FailureReason = topReason(remaining)
+	h.LastCheckedAt = now
+	h.LastFailedAt = now
+	h.Dirty = false
+
+	r.logger.Info().Str("entry", entryName).Str("file", fileName).Str("reason", reason).
+		Msg("Marking broken from live mounted-read failure")
+	r.saveHealth(h)
+}
+
 // ReinsertEntry attempts to fix a torrent by re-inserting it across debrids.
 // Used by the link service and by the repair auto-heal pass.
 func (m *Manager) ReinsertEntry(ctx context.Context, entry *storage.Entry) error {

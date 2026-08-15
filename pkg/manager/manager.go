@@ -590,6 +590,16 @@ func (m *Manager) GetEntry(infohash string) (*storage.Entry, error) {
 	return m.storage.Get(infohash)
 }
 
+// ReportLiveReadFailure marks a mounted file broken off a real read failure
+// (a FUSE backend reporting a failed Read) instead of waiting for the next
+// repair sweep to independently rediscover it. See Repair.RecordLiveReadFailure.
+func (m *Manager) ReportLiveReadFailure(infoHash, entryName, fileName string, size int64) {
+	if m.repair == nil {
+		return
+	}
+	m.repair.RecordLiveReadFailure(infoHash, entryName, fileName, size)
+}
+
 // RefreshTorrent forces an immediate sync for a specific torrent by infohash.
 // Used after re-insertion to pick up the new RD ID without waiting for the 2-min sync cycle.
 func (m *Manager) RefreshTorrent(infohash string) (*storage.Entry, error) {

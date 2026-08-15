@@ -27,6 +27,12 @@ type Manager struct {
 	activeFiles atomic.Int32
 }
 
+// Manager returns the underlying top-level manager, for backends that need
+// to report back to it directly (e.g. live read-failure health reporting).
+func (m *Manager) Manager() *manager.Manager {
+	return m.manager
+}
+
 // fileEntry tracks file metadata
 type fileEntry struct {
 	item     *CacheItem
