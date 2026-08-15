@@ -437,11 +437,32 @@ func (r *Repair) probeFile(ctx context.Context, item *storage.EntryItem, name st
 		res.reason = "media_probe_unavailable"
 		return res
 	}
+	if r.checkPermanentUsenetFailure(entry, name) {
+		res.healthy = false
+		res.broken = true
+		res.reason = "usenet_segment_missing"
+		return res
+	}
 	probe := r.probeMountedMedia(ctx, path)
 	res.healthy = probe.state == mediaProbeHealthy
 	res.broken = probe.state == mediaProbeBroken
 	res.reason = probe.reason
 	return res
+}
+
+// checkPermanentUsenetFailure reports whether filename within entry is
+// already known to be permanently gone from Usenet. This must be checked
+// before attempting a raw mounted read: a FUSE read can only ever surface a
+// generic syscall.EIO to the health probe (the kernel errno boundary erases
+// the original error), so this direct check against the usenet layer's own
+// failure tracking is the only way to distinguish "genuinely and
+// permanently gone" from a transient read failure, and classify the entry
+// as broken/repairable instead of leaving it stuck at unknown.
+func (r *Repair) checkPermanentUsenetFailure(entry *storage.Entry, filename string) bool {
+	if r.manager.usenet == nil || entry == nil || !entry.IsNZB() {
+		return false
+	}
+	return r.manager.usenet.IsFilePermanentlyFailed(entry.InfoHash, filename) != nil
 }
 
 func (r *Repair) probeNZBFile(ctx context.Context, entry *storage.Entry, name string, res fileResult) fileResult {
@@ -1303,6 +1324,11 @@ func (r *Repair) VerifyReplacement(ctx context.Context, req ReplacementVerifyReq
 	if provider.broken {
 		result.Status, result.Reason = "broken", provider.reason
 		r.persistReplacementVerification(target, mediaProbeResult{state: mediaProbeBroken, reason: provider.reason}, time.Now())
+		return result, nil
+	}
+	if r.checkPermanentUsenetFailure(target.entry, target.fileName) {
+		result.Status, result.Reason = "broken", "usenet_segment_missing"
+		r.persistReplacementVerification(target, mediaProbeResult{state: mediaProbeBroken, reason: "usenet_segment_missing"}, time.Now())
 		return result, nil
 	}
 	if !provider.healthy {
