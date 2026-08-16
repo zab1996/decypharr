@@ -121,6 +121,19 @@ If a full sweep would take 2 days at 9 hours/day but `recheck_interval` is `168h
 
 A failure to persist a single entry's health update is logged but never aborts the sweep.
 
+### NZB media validation
+
+For recognized NZB media files, the provider article/segment check runs first. If it
+passes, Decypharr reads bounded head and tail ranges from `__all__` and runs `ffprobe`.
+Missing articles, repeatable media parse failures, and files with no audio or video
+stream are `broken`. Mount read failures, timeouts, permissions, and unavailable probe
+infrastructure remain `unknown` so transient FUSE or host failures cannot trigger an
+automatic replacement.
+
+Each broken-file object includes its exact `info_hash`, entry, filename, reason, and,
+when registered by cli_debrid, `cli_debrid_id`. These identifiers support exact-file
+replacement verification and cleanup without deleting healthy season-pack siblings.
+
 ## Stop and disable
 
 - **Stop** cancels the active run. In-flight probes return at the next checkpoint, the run is marked `cancelled`, and entries that hadn't yet finished probing revert to their previous status.
@@ -147,6 +160,8 @@ A failure to persist a single entry's health update is logged but never aborts t
 | `GET`    | `/api/repair/health/{name}`           | Per-entry health, including the broken-file list.                        |
 | `POST`   | `/api/repair/health/{name}/check`     | Force-recheck this entry.                                                |
 | `POST`   | `/api/repair/recheck/media`           | Recheck a single Arr media item. Body: `{arr, media_id, fix}`. Repairs run through Arr. |
+| `POST`   | `/api/repair/replacements/verify`     | Validate one exact registered NZB replacement. Body: `{cli_debrid_id, info_hash}`. |
+| `POST`   | `/api/repair/replacements/ack`        | Remove one exact old broken file after replacement confirmation. |
 
 ### Examples
 

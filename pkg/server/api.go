@@ -1,6 +1,7 @@
 package server
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -967,6 +968,62 @@ func (s *Server) handleClearBroken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	utils.JSONResponse(w, run, http.StatusOK)
+}
+
+func (s *Server) handleVerifyReplacement(w http.ResponseWriter, r *http.Request) {
+	var req manager.ReplacementVerifyRequest
+	if err := json.ConfigDefault.NewDecoder(r.Body).Decode(&req); err != nil {
+		utils.JSONResponse(w, map[string]string{"code": "invalid_request", "message": "invalid JSON body"}, http.StatusBadRequest)
+		return
+	}
+	svc := s.manager.Repair()
+	if svc == nil {
+		utils.JSONResponse(w, map[string]string{"code": "repair_unavailable", "message": "repair service not available"}, http.StatusServiceUnavailable)
+		return
+	}
+	result, err := svc.VerifyReplacement(r.Context(), req)
+	if err != nil {
+		var exactErr *manager.ReplacementAckError
+		if errors.As(err, &exactErr) {
+			status := http.StatusConflict
+			if exactErr.Code == "invalid_request" || exactErr.Code == "unsupported_media" {
+				status = http.StatusBadRequest
+			}
+			utils.JSONResponse(w, map[string]string{"code": exactErr.Code, "message": exactErr.Message}, status)
+			return
+		}
+		utils.JSONResponse(w, map[string]string{"code": "verification_failed", "message": err.Error()}, http.StatusInternalServerError)
+		return
+	}
+	utils.JSONResponse(w, result, http.StatusOK)
+}
+
+func (s *Server) handleAcknowledgeReplacement(w http.ResponseWriter, r *http.Request) {
+	var req manager.ReplacementAckRequest
+	if err := json.ConfigDefault.NewDecoder(r.Body).Decode(&req); err != nil {
+		utils.JSONResponse(w, map[string]string{"code": "invalid_request", "message": "invalid JSON body"}, http.StatusBadRequest)
+		return
+	}
+	svc := s.manager.Repair()
+	if svc == nil {
+		utils.JSONResponse(w, map[string]string{"code": "repair_unavailable", "message": "repair service not available"}, http.StatusServiceUnavailable)
+		return
+	}
+	result, err := svc.AcknowledgeReplacement(req)
+	if err != nil {
+		var exactErr *manager.ReplacementAckError
+		if errors.As(err, &exactErr) {
+			status := http.StatusConflict
+			if exactErr.Code == "invalid_request" || exactErr.Code == "unsupported_reason" {
+				status = http.StatusBadRequest
+			}
+			utils.JSONResponse(w, map[string]string{"code": exactErr.Code, "message": exactErr.Message}, status)
+			return
+		}
+		utils.JSONResponse(w, map[string]string{"code": "cleanup_failed", "message": err.Error()}, http.StatusInternalServerError)
+		return
+	}
+	utils.JSONResponse(w, result, http.StatusOK)
 }
 
 func (s *Server) handleClearRepairState(w http.ResponseWriter, r *http.Request) {

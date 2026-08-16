@@ -590,6 +590,16 @@ func (m *Manager) GetEntry(infohash string) (*storage.Entry, error) {
 	return m.storage.Get(infohash)
 }
 
+// ReportLiveReadFailure marks a mounted file broken off a real read failure
+// (a FUSE backend reporting a failed Read) instead of waiting for the next
+// repair sweep to independently rediscover it. See Repair.RecordLiveReadFailure.
+func (m *Manager) ReportLiveReadFailure(infoHash, entryName, fileName string, size int64) {
+	if m.repair == nil {
+		return
+	}
+	m.repair.RecordLiveReadFailure(infoHash, entryName, fileName, size)
+}
+
 // RefreshTorrent forces an immediate sync for a specific torrent by infohash.
 // Used after re-insertion to pick up the new RD ID without waiting for the 2-min sync cycle.
 func (m *Manager) RefreshTorrent(infohash string) (*storage.Entry, error) {
@@ -791,6 +801,33 @@ func (m *Manager) deleteGhostEntries() {
 				break
 			}
 			if e.Name == "" || e.OriginalFilename == "" || e.Name == e.OriginalFilename {
+				allRenamed = false
+				break
+			}
+			// e.Name != e.OriginalFilename only proves the Entry record was
+			// renamed at some point — it does not prove a live EntryItem
+			// actually exists under that new name. A rename creates a new
+			// EntryItem via updateEntryItem() but never deletes the old
+			// one, so this check alone can't distinguish "the renamed copy
+			// still exists" from "it was itself deleted/never fully
+			// registered, and this raw-named item is the only copy left."
+			// Confirmed live: this exact gap deleted a file's sole
+			// remaining index entry. Verify a distinct, reachable renamed
+			// EntryItem genuinely contains a file with this same info hash
+			// before trusting it as a safe-to-delete duplicate.
+			renamed, rerr := m.storage.GetEntryItem(e.Name)
+			if rerr != nil || renamed == nil || renamed.Name == item.Name {
+				allRenamed = false
+				break
+			}
+			hasMatchingFile := false
+			for _, rf := range renamed.Files {
+				if rf != nil && rf.InfoHash == f.InfoHash {
+					hasMatchingFile = true
+					break
+				}
+			}
+			if !hasMatchingFile {
 				allRenamed = false
 				break
 			}

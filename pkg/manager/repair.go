@@ -48,6 +48,35 @@ type ClearRepairStateResult struct {
 	Cleared  int                    `json:"cleared"`
 }
 
+type ReplacementVerifyRequest struct {
+	CliDebridID int64  `json:"cli_debrid_id"`
+	InfoHash    string `json:"info_hash"`
+}
+
+type ReplacementVerifyResult struct {
+	Status    string `json:"status"`
+	Reason    string `json:"reason,omitempty"`
+	EntryName string `json:"entry_name,omitempty"`
+	FileName  string `json:"file_name,omitempty"`
+}
+
+type ReplacementAckRequest struct {
+	EntryName   string `json:"entry_name"`
+	FileName    string `json:"file_name"`
+	InfoHash    string `json:"info_hash"`
+	CliDebridID int64  `json:"cli_debrid_id"`
+	Reason      string `json:"reason"`
+}
+
+type ReplacementAckResult struct {
+	Status       string `json:"status"`
+	EntryDeleted bool   `json:"entry_deleted"`
+}
+
+type ReplacementAckError struct{ Code, Message string }
+
+func (e *ReplacementAckError) Error() string { return e.Message }
+
 const (
 	repairSchedulerTag     = "repair-sweep"
 	repairStopSchedulerTag = "repair-sweep-stop"
@@ -65,28 +94,34 @@ const (
 
 // Repair is the health-check / auto-repair service. One instance per Manager.
 type Repair struct {
-	manager   *Manager
-	scheduler gocron.Scheduler
-	logger    zerolog.Logger
+	manager             *Manager
+	scheduler           gocron.Scheduler
+	logger              zerolog.Logger
+	mediaProbeSlots     chan struct{}
+	mediaProbeAttempt   func(context.Context, string) mediaProbeResult
+	replacementNZBProbe func(context.Context, *storage.Entry, string, fileResult) fileResult
 
-	mu             sync.Mutex
-	parentCtx      context.Context
-	activeRunID    string
-	cancelRun      context.CancelFunc
-	scheduled      bool
-	stopScheduled  bool
-	activeStopFunc func() // called by the stop job for the active run
-	runWG          sync.WaitGroup
+	mu                  sync.Mutex
+	parentCtx           context.Context
+	activeRunID         string
+	activeVerifications int
+	cancelRun           context.CancelFunc
+	scheduled           bool
+	stopScheduled       bool
+	activeStopFunc      func() // called by the stop job for the active run
+	runWG               sync.WaitGroup
 }
 
 // NewRepair builds the repair service for the given manager. Call
 // Repair.Start to register the recurring sweep with the scheduler.
 func NewRepair(m *Manager) *Repair {
 	return &Repair{
-		manager:   m,
-		scheduler: m.scheduler,
-		logger:    logger.New("repair"),
-		parentCtx: context.Background(),
+		manager:           m,
+		scheduler:         m.scheduler,
+		logger:            logger.New("repair"),
+		parentCtx:         context.Background(),
+		mediaProbeSlots:   make(chan struct{}, repairMediaProbeConcurrency),
+		mediaProbeAttempt: runMountedMediaProbeAttempt,
 	}
 }
 
@@ -439,6 +474,10 @@ func (r *Repair) runSweep(trigger storage.RepairRunTrigger, opts RepairRunOption
 	}
 
 	r.mu.Lock()
+	if r.activeVerifications > 0 {
+		r.mu.Unlock()
+		return "", errors.New("repair already running (replacement verification active)")
+	}
 	if r.activeRunID != "" {
 		id := r.activeRunID
 		r.mu.Unlock()
@@ -600,6 +639,71 @@ func (r *Repair) saveHealth(state *storage.EntryHealth) {
 	if err := r.manager.storage.SaveEntryHealth(state); err != nil {
 		r.logger.Trace().Err(err).Str("entry", state.EntryName).Msg("Failed to persist entry health")
 	}
+}
+
+// RecordLiveReadFailure marks a single file broken immediately off a real
+// mounted read failure (Plex/Bazarr/etc hitting the file), instead of
+// waiting for the next repair sweep to independently rediscover it. Scoped
+// to NZB entries, matching the rest of the minimal playback-repair workflow.
+//
+// The FUSE read path only ever sees a generic EIO — the kernel errno
+// boundary erases the original error — so this re-derives the reason using
+// the same permanent-usenet-failure check the sweep already relies on
+// (checkPermanentUsenetFailure), rather than trying to infer it from the
+// read error itself.
+func (r *Repair) RecordLiveReadFailure(infoHash, entryName, fileName string, size int64) {
+	if infoHash == "" || entryName == "" || fileName == "" {
+		return
+	}
+	entry, err := r.manager.GetEntry(infoHash)
+	if err != nil || entry == nil || !entry.IsNZB() {
+		return
+	}
+
+	reason := "media_probe_failed"
+	if r.manager.usenet != nil {
+		if permErr := r.manager.usenet.IsFilePermanentlyFailed(infoHash, fileName); permErr != nil {
+			reason = "usenet_segment_missing"
+		}
+	}
+
+	h, _ := r.manager.storage.GetEntryHealth(entryName)
+	if h == nil {
+		h = &storage.EntryHealth{EntryName: entryName, Protocol: entry.Protocol}
+	}
+	// A broken file under active playback can fail many chunked reads in a
+	// single attempt; skip the write if this exact failure is already
+	// recorded rather than re-persisting identical state on every read.
+	for _, bf := range h.BrokenFiles {
+		if bf.FileName == fileName && bf.InfoHash == infoHash && bf.Reason == reason {
+			return
+		}
+	}
+	remaining := make([]storage.BrokenFile, 0, len(h.BrokenFiles)+1)
+	for _, bf := range h.BrokenFiles {
+		if bf.FileName == fileName && bf.InfoHash == infoHash {
+			continue
+		}
+		remaining = append(remaining, bf)
+	}
+	remaining = append(remaining, storage.BrokenFile{
+		EntryName: entryName, FileName: fileName, InfoHash: infoHash,
+		Protocol: entry.Protocol, CliDebridID: entry.CliDebridIDs[fileName],
+		Reason: reason, Size: size,
+	})
+
+	now := time.Now()
+	h.Status = storage.HealthBroken
+	h.BrokenFiles = remaining
+	h.BrokenCount = len(remaining)
+	h.FailureReason = topReason(remaining)
+	h.LastCheckedAt = now
+	h.LastFailedAt = now
+	h.Dirty = false
+
+	r.logger.Info().Str("entry", entryName).Str("file", fileName).Str("reason", reason).
+		Msg("Marking broken from live mounted-read failure")
+	r.saveHealth(h)
 }
 
 // ReinsertEntry attempts to fix a torrent by re-inserting it across debrids.

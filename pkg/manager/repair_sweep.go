@@ -18,6 +18,7 @@ import (
 
 	"github.com/sirrobot01/decypharr/internal/config"
 	"github.com/sirrobot01/decypharr/internal/customerror"
+	"github.com/sirrobot01/decypharr/internal/utils"
 	"github.com/sirrobot01/decypharr/pkg/arr"
 	debrid "github.com/sirrobot01/decypharr/pkg/debrid/common"
 	debridTypes "github.com/sirrobot01/decypharr/pkg/debrid/types"
@@ -73,12 +74,13 @@ func (c *healCache) do(infoHash string, fix func() error) error {
 
 // fileResult is the outcome of probing one file in an entry.
 type fileResult struct {
-	name     string
-	infoHash string
-	protocol config.Protocol
-	healthy  bool
-	broken   bool
-	reason   string // populated only when broken or unknown
+	name        string
+	infoHash    string
+	cliDebridID int64
+	protocol    config.Protocol
+	healthy     bool
+	broken      bool
+	reason      string // populated only when broken or unknown
 }
 
 // executeSweep is the body of a sweep: enumerate, filter due, probe, repair.
@@ -408,6 +410,7 @@ func (r *Repair) probeFile(ctx context.Context, item *storage.EntryItem, name st
 		res.reason = "entry_not_found"
 		return res
 	}
+	res.cliDebridID = entry.CliDebridIDs[name]
 	res.protocol = entry.Protocol
 	if !repairProtocolMatches(r.effectiveProtocolScope(opts), entry.Protocol) {
 		res.reason = "protocol_skipped"
@@ -415,9 +418,51 @@ func (r *Repair) probeFile(ctx context.Context, item *storage.EntryItem, name st
 	}
 
 	if entry.IsNZB() {
-		return r.probeNZBFile(ctx, entry, name, res)
+		res = r.probeNZBFile(ctx, entry, name, res)
+	} else {
+		res = r.probeTorrentFile(ctx, entry, file, name, res, opts)
 	}
-	return r.probeTorrentFile(ctx, entry, file, name, res, opts)
+	// This minimal workflow changes NZB playback repair only. Torrent and
+	// non-media probes retain their upstream provider-only behavior.
+	if !entry.IsNZB() || res.broken || !res.healthy || !utils.IsMediaFile(name) {
+		return res
+	}
+	entryName := item.Name
+	if entryName == "" {
+		entryName = entry.GetFolder()
+	}
+	path, ok := mountedMediaPath(r.manager.config.Mount.MountPath, entryName, name)
+	if !ok {
+		res.healthy = false
+		res.reason = "media_probe_unavailable"
+		return res
+	}
+	if r.checkPermanentUsenetFailure(entry, name) {
+		res.healthy = false
+		res.broken = true
+		res.reason = "usenet_segment_missing"
+		return res
+	}
+	probe := r.probeMountedMedia(ctx, path)
+	res.healthy = probe.state == mediaProbeHealthy
+	res.broken = probe.state == mediaProbeBroken
+	res.reason = probe.reason
+	return res
+}
+
+// checkPermanentUsenetFailure reports whether filename within entry is
+// already known to be permanently gone from Usenet. This must be checked
+// before attempting a raw mounted read: a FUSE read can only ever surface a
+// generic syscall.EIO to the health probe (the kernel errno boundary erases
+// the original error), so this direct check against the usenet layer's own
+// failure tracking is the only way to distinguish "genuinely and
+// permanently gone" from a transient read failure, and classify the entry
+// as broken/repairable instead of leaving it stuck at unknown.
+func (r *Repair) checkPermanentUsenetFailure(entry *storage.Entry, filename string) bool {
+	if r.manager.usenet == nil || entry == nil || !entry.IsNZB() {
+		return false
+	}
+	return r.manager.usenet.IsFilePermanentlyFailed(entry.InfoHash, filename) != nil
 }
 
 func (r *Repair) probeNZBFile(ctx context.Context, entry *storage.Entry, name string, res fileResult) fileResult {
@@ -430,7 +475,8 @@ func (r *Repair) probeNZBFile(ctx context.Context, entry *storage.Entry, name st
 		res.healthy = true
 		return res
 	}
-	if errors.Is(err, customerror.UsenetSegmentMissingError) {
+	var customErr *customerror.Error
+	if errors.Is(err, customerror.UsenetSegmentMissingError) || (errors.As(err, &customErr) && customErr.IsPermanent()) {
 		res.broken = true
 		res.reason = "usenet_segment_missing"
 	} else {
@@ -558,11 +604,12 @@ func (r *Repair) brokenFiles(c *candidate, results []fileResult) []storage.Broke
 			continue
 		}
 		bf := storage.BrokenFile{
-			EntryName: c.name,
-			FileName:  res.name,
-			InfoHash:  res.infoHash,
-			Protocol:  res.protocol,
-			Reason:    res.reason,
+			EntryName:   c.name,
+			FileName:    res.name,
+			InfoHash:    res.infoHash,
+			Protocol:    res.protocol,
+			CliDebridID: res.cliDebridID,
+			Reason:      res.reason,
 		}
 		if file, ok := c.item.Files[res.name]; ok && file != nil {
 			bf.Size = file.Size
@@ -1136,6 +1183,346 @@ func isAlreadyClearedFileError(err error) bool {
 		strings.Contains(msg, "file is deleted")
 }
 
+var replacementCleanupReasons = map[string]struct{}{
+	"usenet_segment_missing":   {},
+	"media_probe_failed":       {},
+	"media_no_playable_stream": {},
+}
+
+type replacementVerifyTarget struct {
+	entry     *storage.Entry
+	entryName string
+	fileName  string
+	file      *storage.File
+}
+
+func (r *Repair) resolveReplacementVerifyTarget(req ReplacementVerifyRequest) (*replacementVerifyTarget, error) {
+	var candidates []*replacementVerifyTarget
+	registeredElsewhere := false
+	err := r.manager.storage.ForEach(func(entry *storage.Entry) error {
+		if entry == nil {
+			return nil
+		}
+		for filename, id := range entry.CliDebridIDs {
+			if id != req.CliDebridID {
+				continue
+			}
+			if entry.InfoHash != req.InfoHash {
+				registeredElsewhere = true
+				continue
+			}
+			_ = r.manager.storage.ForEachEntryItem(func(item *storage.EntryItem) error {
+				if item == nil {
+					return nil
+				}
+				file := item.Files[filename]
+				if file != nil && !file.Deleted && file.InfoHash == req.InfoHash {
+					candidates = append(candidates, &replacementVerifyTarget{
+						entry: entry, entryName: item.Name, fileName: filename, file: file,
+					})
+				}
+				return nil
+			})
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("resolve replacement registration: %w", err)
+	}
+	if len(candidates) == 1 {
+		return candidates[0], nil
+	}
+	if len(candidates) > 1 || registeredElsewhere {
+		return nil, &ReplacementAckError{Code: "stale_target", Message: "replacement identifiers are ambiguous or stale"}
+	}
+	return nil, &ReplacementAckError{Code: "replacement_not_ready", Message: "replacement is not registered as an active mounted file"}
+}
+
+func (r *Repair) persistReplacementVerification(target *replacementVerifyTarget, probe mediaProbeResult, at time.Time) {
+	health, _ := r.manager.storage.GetEntryHealth(target.entryName)
+	if health == nil {
+		health = &storage.EntryHealth{EntryName: target.entryName, Protocol: target.entry.Protocol}
+	}
+	remaining := make([]storage.BrokenFile, 0, len(health.BrokenFiles)+1)
+	for _, broken := range health.BrokenFiles {
+		if broken.FileName == target.fileName && broken.InfoHash == target.entry.InfoHash &&
+			broken.CliDebridID == target.entry.CliDebridIDs[target.fileName] {
+			continue
+		}
+		remaining = append(remaining, broken)
+	}
+	if probe.state == mediaProbeBroken {
+		remaining = append(remaining, storage.BrokenFile{
+			EntryName: target.entryName, FileName: target.fileName,
+			InfoHash: target.entry.InfoHash, Protocol: target.entry.Protocol,
+			CliDebridID: target.entry.CliDebridIDs[target.fileName],
+			Reason:      probe.reason, Size: target.file.Size,
+		})
+		health.Status = storage.HealthBroken
+		health.LastFailedAt = at
+		health.FailureReason = topReason(remaining)
+	} else if len(remaining) == 0 {
+		health.Status = storage.HealthHealthy
+		health.LastOKAt = at
+		health.FailureReason = ""
+	} else {
+		health.Status = storage.HealthBroken
+		health.FailureReason = topReason(remaining)
+	}
+	health.LastCheckedAt = at
+	health.BrokenFiles = remaining
+	health.BrokenCount = len(remaining)
+	health.Dirty = false
+	health.ActiveRunID = ""
+	r.saveHealth(health)
+}
+
+// VerifyReplacement applies the normal NZB article gate and mounted media gate
+// to one exact collected candidate.
+func (r *Repair) VerifyReplacement(ctx context.Context, req ReplacementVerifyRequest) (*ReplacementVerifyResult, error) {
+	req.InfoHash = strings.TrimSpace(req.InfoHash)
+	if req.CliDebridID <= 0 || req.InfoHash == "" {
+		return nil, &ReplacementAckError{Code: "invalid_request", Message: "cli_debrid_id and info_hash are required"}
+	}
+	r.mu.Lock()
+	if r.activeVerifications > 0 {
+		r.mu.Unlock()
+		return nil, errors.New("repair already running (replacement verification active)")
+	}
+	if r.activeRunID != "" {
+		id := r.activeRunID
+		r.mu.Unlock()
+		return nil, &ReplacementAckError{Code: "repair_busy", Message: fmt.Sprintf("repair run %s is active", id)}
+	}
+	r.activeVerifications++
+	r.mu.Unlock()
+	defer func() {
+		r.mu.Lock()
+		r.activeVerifications--
+		r.mu.Unlock()
+	}()
+
+	target, err := r.resolveReplacementVerifyTarget(req)
+	if err != nil {
+		var exactErr *ReplacementAckError
+		if errors.As(err, &exactErr) && exactErr.Code == "replacement_not_ready" {
+			return &ReplacementVerifyResult{Status: "unknown", Reason: exactErr.Code}, nil
+		}
+		return nil, err
+	}
+	if !target.entry.IsNZB() || !utils.IsMediaFile(target.fileName) {
+		return nil, &ReplacementAckError{Code: "unsupported_media", Message: "exact NZB media is required"}
+	}
+	providerProbe := r.probeNZBFile
+	if r.replacementNZBProbe != nil {
+		providerProbe = r.replacementNZBProbe
+	}
+	provider := providerProbe(ctx, target.entry, target.fileName, fileResult{
+		name: target.fileName, infoHash: target.entry.InfoHash,
+		protocol: target.entry.Protocol, cliDebridID: req.CliDebridID,
+	})
+	result := &ReplacementVerifyResult{EntryName: target.entryName, FileName: target.fileName}
+	if provider.broken {
+		result.Status, result.Reason = "broken", provider.reason
+		r.persistReplacementVerification(target, mediaProbeResult{state: mediaProbeBroken, reason: provider.reason}, time.Now())
+		return result, nil
+	}
+	if r.checkPermanentUsenetFailure(target.entry, target.fileName) {
+		result.Status, result.Reason = "broken", "usenet_segment_missing"
+		r.persistReplacementVerification(target, mediaProbeResult{state: mediaProbeBroken, reason: "usenet_segment_missing"}, time.Now())
+		return result, nil
+	}
+	if !provider.healthy {
+		result.Status, result.Reason = "unknown", provider.reason
+		return result, nil
+	}
+	path, ok := mountedMediaPath(r.manager.config.Mount.MountPath, target.entryName, target.fileName)
+	if !ok {
+		result.Status, result.Reason = "unknown", "media_probe_unavailable"
+		return result, nil
+	}
+	probe := r.probeMountedMedia(ctx, path)
+	result.Reason = probe.reason
+	switch probe.state {
+	case mediaProbeHealthy:
+		result.Status = "healthy"
+		r.persistReplacementVerification(target, probe, time.Now())
+	case mediaProbeBroken:
+		result.Status = "broken"
+		r.persistReplacementVerification(target, probe, time.Now())
+	default:
+		result.Status = "unknown"
+	}
+	return result, nil
+}
+
+func (r *Repair) AcknowledgeReplacement(req ReplacementAckRequest) (*ReplacementAckResult, error) {
+	req.EntryName = strings.TrimSpace(req.EntryName)
+	req.FileName = strings.TrimSpace(req.FileName)
+	req.InfoHash = strings.TrimSpace(req.InfoHash)
+	req.Reason = strings.TrimSpace(req.Reason)
+	if req.EntryName == "" || req.FileName == "" || req.InfoHash == "" || req.CliDebridID <= 0 {
+		return nil, &ReplacementAckError{Code: "invalid_request", Message: "exact replacement identifiers are required"}
+	}
+	if _, ok := replacementCleanupReasons[req.Reason]; !ok {
+		return nil, &ReplacementAckError{Code: "unsupported_reason", Message: "reason is not eligible for exact playback cleanup"}
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.activeRunID != "" || r.activeVerifications > 0 {
+		return nil, &ReplacementAckError{Code: "repair_busy", Message: "repair or replacement verification is active"}
+	}
+	item, err := r.manager.storage.GetEntryItem(req.EntryName)
+	if err != nil || item == nil {
+		r.clearAcknowledgedHealth(req)
+		return &ReplacementAckResult{Status: "already_removed", EntryDeleted: true}, nil
+	}
+	file := item.Files[req.FileName]
+	if file == nil || file.Deleted {
+		r.clearAcknowledgedHealth(req)
+		return &ReplacementAckResult{Status: "already_removed"}, nil
+	}
+	if file.InfoHash != req.InfoHash {
+		// The (entry_name, file_name) slot was already overwritten in place by
+		// updateEntryItem when the replacement registered — normal for a
+		// same-named episode — well before this cleanup ack could arrive. If
+		// the file now sitting there is confirmed to be the exact replacement
+		// this repair verified, the old file is already superseded rather
+		// than genuinely stale: acknowledge it and reclaim the orphaned old
+		// provider entry instead of looping forever on stale_target.
+		if r.oldFileSupersededByVerifiedReplacement(req, file) {
+			r.clearAcknowledgedHealth(req)
+			r.deleteOrphanedProviderEntry(req.InfoHash)
+			return &ReplacementAckResult{Status: "already_removed"}, nil
+		}
+		return nil, &ReplacementAckError{Code: "stale_target", Message: "mounted file source changed"}
+	}
+	health, _ := r.manager.storage.GetEntryHealth(req.EntryName)
+	healthMatched := false
+	if health != nil {
+		for _, broken := range health.BrokenFiles {
+			if broken.EntryName == req.EntryName && broken.FileName == req.FileName &&
+				broken.InfoHash == req.InfoHash && broken.CliDebridID == req.CliDebridID && broken.Reason == req.Reason {
+				healthMatched = true
+				break
+			}
+		}
+	}
+	if !healthMatched {
+		return nil, &ReplacementAckError{Code: "stale_target", Message: "exact broken health record does not match"}
+	}
+	entry, entryErr := r.manager.GetEntry(req.InfoHash)
+	providerMissing := entryErr != nil || entry == nil
+	if !providerMissing {
+		// The entry-item lookup above and the health-record match already
+		// independently confirmed (by exact name, hash, and cli_debrid_id)
+		// that this is the right file — this per-hash torrent-index record
+		// is a third, more easily stale source, prone to drifting out of
+		// sync with the entry-item store it's meant to mirror. Only an
+		// actual reassignment to a different, non-zero cli_debrid_id is
+		// real evidence something else has claimed this slot; an empty or
+		// unset registration here is just this record being orphaned, not
+		// a reason to keep blocking a deletion two other checks already
+		// vouched for.
+		if registeredID, ok := entry.CliDebridIDs[req.FileName]; ok && registeredID != 0 && registeredID != req.CliDebridID {
+			return nil, &ReplacementAckError{Code: "stale_target", Message: "mounted registration changed"}
+		}
+	}
+	active := 0
+	for _, candidate := range item.Files {
+		if candidate != nil && !candidate.Deleted {
+			active++
+		}
+	}
+	entryDeleted := active == 1
+	var removeErr error
+	if providerMissing && entryDeleted {
+		removeErr = r.manager.storage.DeleteEntryItemByName(req.EntryName)
+	} else {
+		removeErr = r.manager.RemoveTorrentFile(req.EntryName, req.FileName)
+	}
+	if removeErr != nil && !isAlreadyClearedFileError(removeErr) {
+		return nil, fmt.Errorf("remove exact old file: %w", removeErr)
+	}
+	if entryDeleted {
+		_ = r.manager.storage.DeleteEntryHealth(req.EntryName)
+	} else {
+		remaining := make([]storage.BrokenFile, 0, len(health.BrokenFiles))
+		for _, broken := range health.BrokenFiles {
+			if broken.FileName == req.FileName && broken.InfoHash == req.InfoHash && broken.CliDebridID == req.CliDebridID {
+				continue
+			}
+			remaining = append(remaining, broken)
+		}
+		health.BrokenFiles = remaining
+		health.BrokenCount = len(remaining)
+		if len(remaining) == 0 {
+			r.markBrokenHealthCleared(health, time.Now())
+		} else {
+			health.Status = storage.HealthBroken
+			health.FailureReason = topReason(remaining)
+			r.saveHealth(health)
+		}
+	}
+	status := "removed"
+	if removeErr != nil {
+		status = "already_removed"
+	}
+	return &ReplacementAckResult{Status: status, EntryDeleted: entryDeleted}, nil
+}
+
+// oldFileSupersededByVerifiedReplacement reports whether the file currently
+// registered at req's (entry_name, file_name) is the exact replacement this
+// repair verified and registered, rather than an unrelated file that happens
+// to share the name.
+func (r *Repair) oldFileSupersededByVerifiedReplacement(req ReplacementAckRequest, current *storage.File) bool {
+	if current == nil || current.Deleted {
+		return false
+	}
+	entry, err := r.manager.GetEntry(current.InfoHash)
+	if err != nil || entry == nil {
+		return false
+	}
+	return entry.CliDebridIDs[req.FileName] == req.CliDebridID
+}
+
+// deleteOrphanedProviderEntry best-effort removes the old provider entry left
+// behind when its (entry_name, file_name) slot was overwritten in place by a
+// replacement before exact cleanup could run against it by name. Absence is
+// not an error — the entry may already be gone.
+func (r *Repair) deleteOrphanedProviderEntry(infoHash string) {
+	if err := r.manager.DeleteEntry(infoHash, true); err != nil {
+		r.logger.Debug().Err(err).Str("infohash", infoHash).Msg("AcknowledgeReplacement: orphaned old provider entry already gone")
+	}
+}
+
+func (r *Repair) clearAcknowledgedHealth(req ReplacementAckRequest) {
+	health, _ := r.manager.storage.GetEntryHealth(req.EntryName)
+	if health == nil {
+		return
+	}
+	remaining := make([]storage.BrokenFile, 0, len(health.BrokenFiles))
+	for _, broken := range health.BrokenFiles {
+		if broken.FileName == req.FileName && broken.InfoHash == req.InfoHash &&
+			broken.CliDebridID == req.CliDebridID && broken.Reason == req.Reason {
+			continue
+		}
+		remaining = append(remaining, broken)
+	}
+	if len(remaining) == len(health.BrokenFiles) {
+		return
+	}
+	health.BrokenFiles = remaining
+	health.BrokenCount = len(remaining)
+	if len(remaining) == 0 {
+		r.markBrokenHealthCleared(health, time.Now())
+		return
+	}
+	health.Status = storage.HealthBroken
+	health.FailureReason = topReason(remaining)
+	r.saveHealth(health)
+}
+
 // FixBroken triggers the Arr delete + re-search pass on currently-broken
 // entries without reprobing. When names is empty, every entry with
 // Status=broken in storage is fixed. Returns the new RepairRun record
@@ -1157,6 +1544,10 @@ func (r *Repair) FixBroken(ctx context.Context, names []string) (*storage.Repair
 	}
 
 	r.mu.Lock()
+	if r.activeVerifications > 0 {
+		r.mu.Unlock()
+		return nil, errors.New("repair already running (replacement verification active)")
+	}
 	if r.activeRunID != "" {
 		id := r.activeRunID
 		r.mu.Unlock()
@@ -1230,6 +1621,10 @@ func (r *Repair) ClearBroken(ctx context.Context, names []string) (*storage.Repa
 	}
 
 	r.mu.Lock()
+	if r.activeVerifications > 0 {
+		r.mu.Unlock()
+		return nil, errors.New("repair already running (replacement verification active)")
+	}
 	if r.activeRunID != "" {
 		id := r.activeRunID
 		r.mu.Unlock()

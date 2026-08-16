@@ -79,6 +79,13 @@ func (fh *Handle) Read(ctx context.Context, dest []byte, off int64) (fuse.ReadRe
 		case errors.Is(err, context.Canceled):
 			return nil, syscall.EINTR
 		default:
+			fh.logger.Error().Err(err).Str("file", fh.file.info.Name()).Int64("offset", off).Msg("Read failed, returning EIO")
+			if fh.file.vfs != nil {
+				if mgr := fh.file.vfs.Manager(); mgr != nil {
+					info := fh.file.info
+					mgr.ReportLiveReadFailure(info.InfoHash(), info.Parent(), info.Name(), info.Size())
+				}
+			}
 			return nil, syscall.EIO
 		}
 	}
