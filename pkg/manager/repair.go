@@ -697,6 +697,8 @@ func (r *Repair) RecordLiveReadFailure(infoHash, entryName, fileName string, siz
 func (r *Repair) verifyLiveTorrentFailure(infoHash, entryName, fileName string, size int64) {
 	item, err := r.manager.GetEntryItem(entryName)
 	if err != nil || item == nil {
+		r.logger.Warn().Err(err).Str("entry", entryName).Str("file", fileName).
+			Msg("verifyLiveTorrentFailure: entry item lookup failed, skipping re-probe")
 		return
 	}
 	ctx := r.parentCtx
@@ -709,6 +711,9 @@ func (r *Repair) verifyLiveTorrentFailure(infoHash, entryName, fileName string, 
 		r.recordBrokenFile(entryName, infoHash, fileName, res.protocol, res.cliDebridID, res.reason, size)
 	case res.healthy:
 		r.clearBrokenFile(entryName, infoHash, fileName)
+	default:
+		r.logger.Info().Str("entry", entryName).Str("file", fileName).Str("reason", res.reason).
+			Msg("verifyLiveTorrentFailure: re-probe inconclusive after live-read failure, leaving state unchanged")
 	}
 }
 
