@@ -641,21 +641,30 @@ func (r *Repair) saveHealth(state *storage.EntryHealth) {
 	}
 }
 
-// RecordLiveReadFailure marks a single file broken immediately off a real
-// mounted read failure (Plex/Bazarr/etc hitting the file), instead of
-// waiting for the next repair sweep to independently rediscover it. Covers
-// both NZB and torrent/debrid entries — always exactly the one file that
-// just failed a real read, never the whole entry.
+// RecordLiveReadFailure reacts to a real mounted read failure (Plex/Bazarr/etc
+// hitting the file), instead of waiting for the next repair sweep to
+// independently rediscover it. Covers both NZB and torrent/debrid entries —
+// always exactly the one file that just failed a real read, never the whole
+// entry.
 //
 // The FUSE read path only ever sees a generic EIO — the kernel errno
-// boundary erases the original error — so this re-derives the reason per
-// protocol: the same permanent-usenet-failure check the sweep already
-// relies on for NZB (checkPermanentUsenetFailure), or entry.Bad for
-// torrent/debrid (set by link.Service once it gives up re-inserting this
-// entry — see markEntryBad). Either way this only ever fires for the exact
-// file that just failed to read, so it can't misclassify a healthy
-// sibling file in the same entry the way checking entry.Bad up front
-// (independent of which file is being read) would.
+// boundary erases the original error — so NZB and torrent take different
+// paths from there:
+//
+//   - NZB has a cheap, authoritative, already-tracked signal available
+//     instantly: checkPermanentUsenetFailure/IsFilePermanentlyFailed reports
+//     the usenet layer's own record of which segments/articles are actually
+//     missing. That's a real verification, not a guess, so it's safe to
+//     trust synchronously and commit "broken" right away.
+//   - Torrent/debrid has no equivalent cheap local signal — a raw EIO could
+//     just as easily be a transient hoster/network blip as a genuinely dead
+//     link (entry.Bad is a hint, not proof: it can flip back to false
+//     moments later). So instead of trusting the EIO, this kicks off an
+//     async re-probe using the exact same CheckFile/ffprobe path a sweep
+//     uses (probeFile), and only commits "broken" once that confirms it —
+//     never off the EIO alone. Async so it never blocks the read path even
+//     though the underlying check (and, if the media-probe toggle is on,
+//     ffprobe) can take real time.
 func (r *Repair) RecordLiveReadFailure(infoHash, entryName, fileName string, size int64) {
 	if infoHash == "" || entryName == "" || fileName == "" {
 		return
@@ -665,31 +674,53 @@ func (r *Repair) RecordLiveReadFailure(infoHash, entryName, fileName string, siz
 		return
 	}
 
-	var reason string
 	switch {
 	case entry.IsNZB():
-		reason = "media_probe_failed"
+		reason := "media_probe_failed"
 		if r.manager.usenet != nil {
 			if permErr := r.manager.usenet.IsFilePermanentlyFailed(infoHash, fileName); permErr != nil {
 				reason = "usenet_segment_missing"
 			}
 		}
+		r.recordBrokenFile(entryName, infoHash, fileName, entry.Protocol, entry.CliDebridIDs[fileName], reason, size)
 	case entry.IsTorrent():
-		reason = "mounted_read_failed"
-		if entry.Bad {
-			reason = "entry_marked_bad"
-		}
-	default:
+		go r.verifyLiveTorrentFailure(infoHash, entryName, fileName, size)
+	}
+}
+
+// verifyLiveTorrentFailure re-probes one torrent file the same way a sweep
+// would (probeFile: CheckFile, plus ffprobe when the debrid media-probe
+// toggle is on and CheckFile confirms healthy) and only writes a result once
+// that probe is conclusive. An inconclusive result (neither confirmed broken
+// nor confirmed healthy — e.g. CheckFile itself erroring) leaves existing
+// health state untouched rather than flapping on every ambiguous read.
+func (r *Repair) verifyLiveTorrentFailure(infoHash, entryName, fileName string, size int64) {
+	item, err := r.manager.GetEntryItem(entryName)
+	if err != nil || item == nil {
 		return
 	}
+	ctx := r.parentCtx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	res := r.probeFile(ctx, item, fileName, RepairRunOptions{})
+	switch {
+	case res.broken:
+		r.recordBrokenFile(entryName, infoHash, fileName, res.protocol, res.cliDebridID, res.reason, size)
+	case res.healthy:
+		r.clearBrokenFile(entryName, infoHash, fileName)
+	}
+}
 
+// recordBrokenFile writes/updates a single BrokenFile entry for entryName.
+// A broken file under active playback can fail many chunked reads in a
+// single attempt; skip the write if this exact failure is already recorded
+// rather than re-persisting identical state on every read.
+func (r *Repair) recordBrokenFile(entryName, infoHash, fileName string, protocol config.Protocol, cliDebridID int64, reason string, size int64) {
 	h, _ := r.manager.storage.GetEntryHealth(entryName)
 	if h == nil {
-		h = &storage.EntryHealth{EntryName: entryName, Protocol: entry.Protocol}
+		h = &storage.EntryHealth{EntryName: entryName, Protocol: protocol}
 	}
-	// A broken file under active playback can fail many chunked reads in a
-	// single attempt; skip the write if this exact failure is already
-	// recorded rather than re-persisting identical state on every read.
 	for _, bf := range h.BrokenFiles {
 		if bf.FileName == fileName && bf.InfoHash == infoHash && bf.Reason == reason {
 			return
@@ -704,7 +735,7 @@ func (r *Repair) RecordLiveReadFailure(infoHash, entryName, fileName string, siz
 	}
 	remaining = append(remaining, storage.BrokenFile{
 		EntryName: entryName, FileName: fileName, InfoHash: infoHash,
-		Protocol: entry.Protocol, CliDebridID: entry.CliDebridIDs[fileName],
+		Protocol: protocol, CliDebridID: cliDebridID,
 		Reason: reason, Size: size,
 	})
 
@@ -719,6 +750,46 @@ func (r *Repair) RecordLiveReadFailure(infoHash, entryName, fileName string, siz
 
 	r.logger.Info().Str("entry", entryName).Str("file", fileName).Str("reason", reason).
 		Msg("Marking broken from live mounted-read failure")
+	r.saveHealth(h)
+}
+
+// clearBrokenFile removes a single file's BrokenFile entry once a
+// verification confirms it's actually healthy — e.g. after
+// verifyLiveTorrentFailure's re-probe contradicts an earlier live-read
+// failure that turned out to be a transient blip.
+func (r *Repair) clearBrokenFile(entryName, infoHash, fileName string) {
+	h, _ := r.manager.storage.GetEntryHealth(entryName)
+	if h == nil || len(h.BrokenFiles) == 0 {
+		return
+	}
+	remaining := make([]storage.BrokenFile, 0, len(h.BrokenFiles))
+	found := false
+	for _, bf := range h.BrokenFiles {
+		if bf.FileName == fileName && bf.InfoHash == infoHash {
+			found = true
+			continue
+		}
+		remaining = append(remaining, bf)
+	}
+	if !found {
+		return
+	}
+
+	now := time.Now()
+	h.BrokenFiles = remaining
+	h.BrokenCount = len(remaining)
+	h.LastCheckedAt = now
+	if len(remaining) == 0 {
+		h.Status = storage.HealthHealthy
+		h.LastOKAt = now
+		h.FailureReason = ""
+	} else {
+		h.FailureReason = topReason(remaining)
+	}
+	h.Dirty = false
+
+	r.logger.Info().Str("entry", entryName).Str("file", fileName).
+		Msg("Cleared broken file: live-read re-verification confirmed healthy")
 	r.saveHealth(h)
 }
 
