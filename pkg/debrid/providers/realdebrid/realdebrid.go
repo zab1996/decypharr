@@ -768,6 +768,24 @@ func (r *RealDebrid) CheckFile(ctx context.Context, infohash, link string) error
 		return customerror.HosterUnavailableError
 	}
 
+	// Diagnostic only for now: a link that consistently fails real downloads
+	// has never once been flagged broken by this check across extensive live
+	// testing, which means RD likely isn't returning a bare 404 for at least
+	// some real failure modes here — but broadening the classification
+	// (e.g. "any non-200 is broken") without knowing what RD actually
+	// returns risks the same mistake already made and reverted elsewhere
+	// today: a transient/unrelated non-200 (rate limit, auth hiccup) on an
+	// otherwise-healthy file would then get misclassified broken too. Log
+	// the real response first; decide the actual classification from that.
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		r.logger.Warn().
+			Int("status", resp.StatusCode).
+			Str("infohash", infohash).
+			Str("body", string(body)).
+			Msg("CheckFile: non-200/404 response from /unrestrict/check")
+	}
+
 	return nil
 }
 
