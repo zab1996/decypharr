@@ -692,11 +692,31 @@ func (r *Repair) RecordLiveReadFailure(infoHash, entryName, fileName string, siz
 		}
 		r.recordBrokenFile(entryName, infoHash, fileName, entry.Protocol, entry.CliDebridIDs[fileName], reason, size)
 	case entry.IsTorrent():
+		if r.fileAlreadyKnownBroken(entryName, fileName) {
+			// Already confirmed broken — no need to spend a fresh
+			// CheckFile/ffprobe call re-discovering that on every subsequent
+			// read failure. The next scheduled sweep (or a manual recheck)
+			// is what notices if it recovers.
+			return
+		}
 		if !r.shouldVerifyLiveTorrentFailure(entryName, fileName) {
 			return
 		}
 		go r.verifyLiveTorrentFailure(infoHash, entryName, fileName, size)
 	}
+}
+
+func (r *Repair) fileAlreadyKnownBroken(entryName, fileName string) bool {
+	h, _ := r.manager.storage.GetEntryHealth(entryName)
+	if h == nil {
+		return false
+	}
+	for _, bf := range h.BrokenFiles {
+		if bf.FileName == fileName {
+			return true
+		}
+	}
+	return false
 }
 
 // liveVerifyCooldownWindow bounds how often verifyLiveTorrentFailure re-probes
