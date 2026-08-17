@@ -323,6 +323,15 @@ func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, hea
 		c.item = item
 	}
 
+	// Held for the full probe, not just the final save: recordBrokenFile/
+	// clearBrokenFile (the async live-verify path) do their own
+	// read-modify-write of this same EntryHealth record, and without this
+	// lock a live-verify write landing mid-probe gets silently lost when
+	// this function's own final save overwrites it wholesale (or vice
+	// versa). See lockEntryHealth.
+	unlock := r.lockEntryHealth(c.name)
+	defer unlock()
+
 	h, _ := s.GetEntryHealth(c.name)
 	if h == nil {
 		h = &storage.EntryHealth{EntryName: c.name}

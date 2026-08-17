@@ -108,6 +108,17 @@ type Repair struct {
 	// fresh CheckFile/ffprobe re-probe goroutine per read.
 	liveVerifyCooldown *xsync.Map[string, time.Time]
 
+	// entryHealthLocks serializes reads/writes to one entry's EntryHealth
+	// record across probeEntry (full sweep/manual-recheck probes) and the
+	// async live-verify path (recordBrokenFile/clearBrokenFile) — both do
+	// their own unprotected read-modify-write cycle on the same record.
+	// Without this, several files in the same entry failing near-
+	// simultaneously spawn concurrent goroutines that race: each reads a
+	// stale snapshot missing the others' not-yet-saved additions, so only
+	// the last write survives and the rest are silently lost. See
+	// lockEntryHealth.
+	entryHealthLocks *xsync.Map[string, *sync.Mutex]
+
 	mu                  sync.Mutex
 	parentCtx           context.Context
 	activeRunID         string
@@ -130,10 +141,22 @@ func NewRepair(m *Manager) *Repair {
 		mediaProbeSlots:    make(chan struct{}, repairMediaProbeConcurrency),
 		mediaProbeAttempt:  runMountedMediaProbeAttempt,
 		liveVerifyCooldown: xsync.NewMap[string, time.Time](),
+		entryHealthLocks:   xsync.NewMap[string, *sync.Mutex](),
 	}
 }
 
 func (r *Repair) cfg() config.RepairConfig { return config.Get().Repair }
+
+// lockEntryHealth acquires the per-entry lock guarding EntryHealth reads and
+// writes for entryName, creating it on first use, and returns the unlock
+// function. Every read-modify-write of a given entry's EntryHealth record
+// (probeEntry, recordBrokenFile, clearBrokenFile) must hold this for the
+// full span from read to save.
+func (r *Repair) lockEntryHealth(entryName string) func() {
+	mu, _ := r.entryHealthLocks.LoadOrStore(entryName, &sync.Mutex{})
+	mu.Lock()
+	return mu.Unlock
+}
 
 func normalizeRepairProtocolScope(scope string) string {
 	switch strings.ToLower(strings.TrimSpace(scope)) {
@@ -787,18 +810,18 @@ func (r *Repair) entryIsBad(infoHash string) bool {
 // single attempt; skip the write if this exact failure is already recorded
 // rather than re-persisting identical state on every read.
 func (r *Repair) recordBrokenFile(entryName, infoHash, fileName string, protocol config.Protocol, cliDebridID int64, reason string, size int64) {
+	unlock := r.lockEntryHealth(entryName)
+	defer unlock()
+
 	h, _ := r.manager.storage.GetEntryHealth(entryName)
 	if h == nil {
 		h = &storage.EntryHealth{EntryName: entryName}
 	}
 	// Always set, not just on first create: probeEntry (sweep/manual recheck)
 	// resets Protocol to "" at the start of a probe and restores it at the
-	// end, so a live-read verification landing in that window (this function
-	// and probeEntry both read-modify-write the same EntryHealth record with
-	// no coordination between them) can otherwise persist the stale reset
-	// value if its write lands after probeEntry's own reset but before
-	// probeEntry's restore. This is always the caller's freshly-probed
-	// protocol, so it's always safe to just overwrite.
+	// end. This is always the caller's freshly-probed protocol, so it's
+	// always safe to just overwrite (also see lockEntryHealth — the lock is
+	// what actually prevents the reset-vs-restore race this guards against).
 	if protocol != "" {
 		h.Protocol = protocol
 	}
@@ -839,6 +862,9 @@ func (r *Repair) recordBrokenFile(entryName, infoHash, fileName string, protocol
 // verifyLiveTorrentFailure's re-probe contradicts an earlier live-read
 // failure that turned out to be a transient blip.
 func (r *Repair) clearBrokenFile(entryName, infoHash, fileName string) {
+	unlock := r.lockEntryHealth(entryName)
+	defer unlock()
+
 	h, _ := r.manager.storage.GetEntryHealth(entryName)
 	if h == nil || len(h.BrokenFiles) == 0 {
 		return
