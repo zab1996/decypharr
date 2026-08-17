@@ -422,9 +422,11 @@ func (r *Repair) probeFile(ctx context.Context, item *storage.EntryItem, name st
 	} else {
 		res = r.probeTorrentFile(ctx, entry, file, name, res, opts)
 	}
-	// This minimal workflow changes NZB playback repair only. Torrent and
-	// non-media probes retain their upstream provider-only behavior.
-	if !entry.IsNZB() || res.broken || !res.healthy || !utils.IsMediaFile(name) {
+	// The mounted-media ffprobe check is gated per protocol by
+	// Repair.MediaProbeUsenet/MediaProbeDebrid (see RepairConfig.MediaProbeEnabled).
+	// r.cfg() is read live here rather than threaded from the sweep's opening
+	// snapshot, matching effectiveProtocolScope's pattern just above.
+	if !r.cfg().MediaProbeEnabled(entry.IsNZB()) || res.broken || !res.healthy || !utils.IsMediaFile(name) {
 		return res
 	}
 	entryName := item.Name

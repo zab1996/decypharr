@@ -1342,6 +1342,30 @@
                                 </select>
                             </div>
                         </div>
+
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                            <label class="label cursor-pointer justify-start gap-3">
+                                <input type="checkbox" class="checkbox checkbox-primary checkbox-sm"
+                                       id="repair.media_probe_usenet" name="repair.media_probe_usenet">
+                                <div>
+                                    <span class="label-text font-medium">Media probe (Usenet)</span>
+                                    <div class="label-text-alt">ffprobe-check mounted NZB files for playability during
+                                        repair, on top of the existing missing-article/segment check. On by default.
+                                    </div>
+                                </div>
+                            </label>
+                            <label class="label cursor-pointer justify-start gap-3">
+                                <input type="checkbox" class="checkbox checkbox-primary checkbox-sm"
+                                       id="repair.media_probe_debrid" name="repair.media_probe_debrid">
+                                <div>
+                                    <span class="label-text font-medium">Media probe (Debrid)</span>
+                                    <div class="label-text-alt">ffprobe-check mounted torrent/debrid files for
+                                        playability during repair, on top of the existing hoster-availability check.
+                                        Off by default.
+                                    </div>
+                                </div>
+                            </label>
+                        </div>
                     </div>
                 </div>
 
