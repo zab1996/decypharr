@@ -782,27 +782,23 @@ func (r *Repair) verifyLiveTorrentFailure(infoHash, entryName, fileName string, 
 		r.recordBrokenFile(entryName, infoHash, fileName, res.protocol, res.cliDebridID, res.reason, size)
 	case res.healthy:
 		r.clearBrokenFile(entryName, infoHash, fileName)
-	case res.reason == "media_probe_unavailable" && r.entryIsBad(infoHash):
-		// media_probe_unavailable means probeMountedMedia's own read of this
-		// file failed for "infrastructure" reasons — but that read goes
-		// through the exact same GetLink path that's already failing for
-		// this file in real playback. When the underlying entry has also
-		// given up re-inserting (entry.Bad), that's not an ambiguous result
-		// anymore: the verification is inconclusive only because the file is
-		// genuinely unreachable, not because of an unrelated transient
-		// hiccup. Three converging signals (the original live EIO, entry.Bad,
-		// and this re-probe's own read failing the same way) is enough to
-		// commit "broken" here, unlike a bare EIO alone.
-		r.recordBrokenFile(entryName, infoHash, fileName, res.protocol, res.cliDebridID, "entry_marked_bad", size)
 	default:
+		// Deliberately no entry.Bad-based fallback here. It was tried
+		// (commit history) and reverted: entry.Bad is entry-wide and can be
+		// true from a transient provider hiccup affecting every file in the
+		// entry at once, not proof about this specific file. Combined with a
+		// media_probe_unavailable result (which itself just means
+		// probeMountedMedia's read failed the same way the original EIO did
+		// — not independent confirmation), using it to commit "broken" meant
+		// a single torrent-wide RD blip could flag every file in a season
+		// pack as broken simultaneously, even ones that play back fine
+		// moments later. Only a genuinely conclusive probeFile result
+		// (CheckFile confirming HosterUnavailableError, or ffprobe actually
+		// running and confirming bad content) marks broken here — anything
+		// else leaves existing health state untouched rather than guessing.
 		r.logger.Info().Str("entry", entryName).Str("file", fileName).Str("reason", res.reason).
 			Msg("verifyLiveTorrentFailure: re-probe inconclusive after live-read failure, leaving state unchanged")
 	}
-}
-
-func (r *Repair) entryIsBad(infoHash string) bool {
-	entry, err := r.manager.GetEntry(infoHash)
-	return err == nil && entry != nil && entry.Bad
 }
 
 // recordBrokenFile writes/updates a single BrokenFile entry for entryName.
