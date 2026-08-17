@@ -759,12 +759,20 @@ func (r *Repair) shouldVerifyLiveTorrentFailure(entryName, fileName string) bool
 	return true
 }
 
-// verifyLiveTorrentFailure re-probes one torrent file the same way a sweep
-// would (probeFile: CheckFile, plus ffprobe when the debrid media-probe
-// toggle is on and CheckFile confirms healthy) and only writes a result once
-// that probe is conclusive. An inconclusive result (neither confirmed broken
-// nor confirmed healthy — e.g. CheckFile itself erroring) leaves existing
-// health state untouched rather than flapping on every ambiguous read.
+// verifyLiveTorrentFailure re-probes one torrent file and only writes a
+// result once that probe is conclusive. An inconclusive result leaves
+// existing health state untouched rather than flapping on every ambiguous
+// read.
+//
+// Uses UnrestrictLink: true so probeFile routes through
+// probeTorrentFileByUnrestrict (a direct GetDownloadLink call — the same
+// mechanism real playback and the mount both use) instead of the default
+// CheckFile-based path. CheckFile hits RD's /unrestrict/check endpoint,
+// which validates something more superficial than actual downloadability —
+// confirmed live, it returned a clean 200 for a link that consistently
+// fails every real download attempt, meaning it can silently report a
+// genuinely broken file as healthy. GetDownloadLink is the ground truth: if
+// it can't produce a usable link, the file is actually unreachable.
 func (r *Repair) verifyLiveTorrentFailure(infoHash, entryName, fileName string, size int64) {
 	item, err := r.manager.GetEntryItem(entryName)
 	if err != nil || item == nil {
@@ -776,7 +784,7 @@ func (r *Repair) verifyLiveTorrentFailure(infoHash, entryName, fileName string, 
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	res := r.probeFile(ctx, item, fileName, RepairRunOptions{})
+	res := r.probeFile(ctx, item, fileName, RepairRunOptions{UnrestrictLink: true})
 	switch {
 	case res.broken:
 		r.recordBrokenFile(entryName, infoHash, fileName, res.protocol, res.cliDebridID, res.reason, size)
