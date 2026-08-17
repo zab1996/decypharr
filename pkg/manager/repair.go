@@ -643,28 +643,44 @@ func (r *Repair) saveHealth(state *storage.EntryHealth) {
 
 // RecordLiveReadFailure marks a single file broken immediately off a real
 // mounted read failure (Plex/Bazarr/etc hitting the file), instead of
-// waiting for the next repair sweep to independently rediscover it. Scoped
-// to NZB entries, matching the rest of the minimal playback-repair workflow.
+// waiting for the next repair sweep to independently rediscover it. Covers
+// both NZB and torrent/debrid entries — always exactly the one file that
+// just failed a real read, never the whole entry.
 //
 // The FUSE read path only ever sees a generic EIO — the kernel errno
-// boundary erases the original error — so this re-derives the reason using
-// the same permanent-usenet-failure check the sweep already relies on
-// (checkPermanentUsenetFailure), rather than trying to infer it from the
-// read error itself.
+// boundary erases the original error — so this re-derives the reason per
+// protocol: the same permanent-usenet-failure check the sweep already
+// relies on for NZB (checkPermanentUsenetFailure), or entry.Bad for
+// torrent/debrid (set by link.Service once it gives up re-inserting this
+// entry — see markEntryBad). Either way this only ever fires for the exact
+// file that just failed to read, so it can't misclassify a healthy
+// sibling file in the same entry the way checking entry.Bad up front
+// (independent of which file is being read) would.
 func (r *Repair) RecordLiveReadFailure(infoHash, entryName, fileName string, size int64) {
 	if infoHash == "" || entryName == "" || fileName == "" {
 		return
 	}
 	entry, err := r.manager.GetEntry(infoHash)
-	if err != nil || entry == nil || !entry.IsNZB() {
+	if err != nil || entry == nil {
 		return
 	}
 
-	reason := "media_probe_failed"
-	if r.manager.usenet != nil {
-		if permErr := r.manager.usenet.IsFilePermanentlyFailed(infoHash, fileName); permErr != nil {
-			reason = "usenet_segment_missing"
+	var reason string
+	switch {
+	case entry.IsNZB():
+		reason = "media_probe_failed"
+		if r.manager.usenet != nil {
+			if permErr := r.manager.usenet.IsFilePermanentlyFailed(infoHash, fileName); permErr != nil {
+				reason = "usenet_segment_missing"
+			}
 		}
+	case entry.IsTorrent():
+		reason = "mounted_read_failed"
+		if entry.Bad {
+			reason = "entry_marked_bad"
+		}
+	default:
+		return
 	}
 
 	h, _ := r.manager.storage.GetEntryHealth(entryName)

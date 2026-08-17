@@ -488,18 +488,13 @@ func (r *Repair) probeNZBFile(ctx context.Context, entry *storage.Entry, name st
 }
 
 func (r *Repair) probeTorrentFile(ctx context.Context, entry *storage.Entry, file *storage.File, name string, res fileResult, opts RepairRunOptions) fileResult {
-	// entry.Bad is set by the link service (pkg/manager/link) once it gives up
-	// re-inserting after repeated empty/unresolvable download links — see
-	// markEntryBad. That flag only ever short-circuits GetLink for the FUSE
-	// mount; it was otherwise invisible to the repair health store and to
-	// cli_debrid's activity log. Surface it here as a normal broken result so
-	// it flows through the same sweep/manual-recheck pipeline as every other
-	// broken reason.
-	if entry.Bad {
-		res.broken = true
-		res.reason = "entry_marked_bad"
-		return res
-	}
+	// entry.Bad (set by link.Service.markEntryBad) is entry-wide, but a Bad
+	// entry can still have individual files that resolve fine — GetLink only
+	// consults entry.Bad for a file whose own resolution already failed, so
+	// treating it as blanket-broken here would wrongly flag every other file
+	// in the entry too. Real per-file precision comes from CheckFile below
+	// during a sweep, and from RecordLiveReadFailure the instant an actual
+	// mounted read fails (see repair.go).
 	client := r.manager.ProviderClient(entry.ActiveProvider)
 	if client == nil {
 		res.reason = "provider_client_not_found"
