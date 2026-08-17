@@ -435,7 +435,21 @@ func (r *Repair) probeFile(ctx context.Context, item *storage.EntryItem, name st
 	// Repair.MediaProbeUsenet/MediaProbeDebrid (see RepairConfig.MediaProbeEnabled).
 	// r.cfg() is read live here rather than threaded from the sweep's opening
 	// snapshot, matching effectiveProtocolScope's pattern just above.
-	if !r.cfg().MediaProbeEnabled(entry.IsNZB()) || res.broken || !res.healthy || !utils.IsMediaFile(name) {
+	//
+	// requireHealthy: NZB only runs ffprobe once probeNZBFile has confirmed
+	// segments are intact — a genuinely missing-segment file already returns
+	// broken=true above and never reaches here. Torrent is different:
+	// CheckFile validates whether a specific already-stored link is still
+	// resolvable, which is a narrower question than "can a download link be
+	// resolved for this file at all" — for a file whose actual problem is an
+	// unresolvable link, CheckFile can stay permanently inconclusive
+	// (neither confirming broken nor healthy) without ever reflecting the
+	// real state. Gating ffprobe behind res.healthy would then mean it never
+	// runs at all for exactly the files that most need an independent check.
+	// So torrent allows ffprobe as a second opinion whenever CheckFile
+	// hasn't already confirmed broken, not only when it confirms healthy.
+	requireHealthy := entry.IsNZB()
+	if !r.cfg().MediaProbeEnabled(entry.IsNZB()) || res.broken || (requireHealthy && !res.healthy) || !utils.IsMediaFile(name) {
 		return res
 	}
 	entryName := item.Name

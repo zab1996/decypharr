@@ -752,7 +752,7 @@ func (r *RealDebrid) CheckFile(ctx context.Context, infohash, link string) error
 		form.Set(k, v)
 	}
 
-	req, err := http.NewRequest(http.MethodPost, r.Host+"/unrestrict/check", strings.NewReader(form.Encode()))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, r.Host+"/unrestrict/check", strings.NewReader(form.Encode()))
 	if err != nil {
 		return err
 	}
