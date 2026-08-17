@@ -789,7 +789,18 @@ func (r *Repair) entryIsBad(infoHash string) bool {
 func (r *Repair) recordBrokenFile(entryName, infoHash, fileName string, protocol config.Protocol, cliDebridID int64, reason string, size int64) {
 	h, _ := r.manager.storage.GetEntryHealth(entryName)
 	if h == nil {
-		h = &storage.EntryHealth{EntryName: entryName, Protocol: protocol}
+		h = &storage.EntryHealth{EntryName: entryName}
+	}
+	// Always set, not just on first create: probeEntry (sweep/manual recheck)
+	// resets Protocol to "" at the start of a probe and restores it at the
+	// end, so a live-read verification landing in that window (this function
+	// and probeEntry both read-modify-write the same EntryHealth record with
+	// no coordination between them) can otherwise persist the stale reset
+	// value if its write lands after probeEntry's own reset but before
+	// probeEntry's restore. This is always the caller's freshly-probed
+	// protocol, so it's always safe to just overwrite.
+	if protocol != "" {
+		h.Protocol = protocol
 	}
 	for _, bf := range h.BrokenFiles {
 		if bf.FileName == fileName && bf.InfoHash == infoHash && bf.Reason == reason {
