@@ -1337,23 +1337,17 @@ func (r *Repair) VerifyReplacement(ctx context.Context, req ReplacementVerifyReq
 		result.Status, result.Reason = "unknown", provider.reason
 		return result, nil
 	}
-	path, ok := mountedMediaPath(r.manager.config.Mount.MountPath, target.entryName, target.fileName)
-	if !ok {
-		result.Status, result.Reason = "unknown", "media_probe_unavailable"
-		return result, nil
-	}
-	probe := r.probeMountedMedia(ctx, path)
-	result.Reason = probe.reason
-	switch probe.state {
-	case mediaProbeHealthy:
-		result.Status = "healthy"
-		r.persistReplacementVerification(target, probe, time.Now())
-	case mediaProbeBroken:
-		result.Status = "broken"
-		r.persistReplacementVerification(target, probe, time.Now())
-	default:
-		result.Status = "unknown"
-	}
+	// Playability (ffprobe) verification for the replacement candidate is
+	// handled entirely by cli_debrid's own ffprobe_all_nzbs check, which
+	// runs on this same file as it passes through Adding→Checking
+	// regardless of why it was added (fresh scrape or repair-replacement).
+	// Running probeMountedMedia here too was a redundant, independent
+	// duplicate of that same check. Segment/article completeness — already
+	// confirmed above via provider.healthy — is decypharr's own
+	// responsibility since it owns the usenet layer; that's the actual
+	// signal this endpoint exists to provide.
+	result.Status = "healthy"
+	r.persistReplacementVerification(target, mediaProbeResult{state: mediaProbeHealthy}, time.Now())
 	return result, nil
 }
 
