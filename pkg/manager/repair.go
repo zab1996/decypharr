@@ -16,6 +16,7 @@ import (
 
 	"github.com/go-co-op/gocron/v2"
 	"github.com/google/uuid"
+	"github.com/puzpuzpuz/xsync/v4"
 	"github.com/rs/zerolog"
 
 	"github.com/sirrobot01/decypharr/internal/config"
@@ -101,6 +102,12 @@ type Repair struct {
 	mediaProbeAttempt   func(context.Context, string) mediaProbeResult
 	replacementNZBProbe func(context.Context, *storage.Entry, string, fileResult) fileResult
 
+	// liveVerifyCooldown tracks the last time verifyLiveTorrentFailure ran for
+	// a given "entryName|fileName", so a file under active playback that fails
+	// every chunked read (which can be many times a second) doesn't spawn a
+	// fresh CheckFile/ffprobe re-probe goroutine per read.
+	liveVerifyCooldown *xsync.Map[string, time.Time]
+
 	mu                  sync.Mutex
 	parentCtx           context.Context
 	activeRunID         string
@@ -116,12 +123,13 @@ type Repair struct {
 // Repair.Start to register the recurring sweep with the scheduler.
 func NewRepair(m *Manager) *Repair {
 	return &Repair{
-		manager:           m,
-		scheduler:         m.scheduler,
-		logger:            logger.New("repair"),
-		parentCtx:         context.Background(),
-		mediaProbeSlots:   make(chan struct{}, repairMediaProbeConcurrency),
-		mediaProbeAttempt: runMountedMediaProbeAttempt,
+		manager:            m,
+		scheduler:          m.scheduler,
+		logger:             logger.New("repair"),
+		parentCtx:          context.Background(),
+		mediaProbeSlots:    make(chan struct{}, repairMediaProbeConcurrency),
+		mediaProbeAttempt:  runMountedMediaProbeAttempt,
+		liveVerifyCooldown: xsync.NewMap[string, time.Time](),
 	}
 }
 
@@ -684,8 +692,28 @@ func (r *Repair) RecordLiveReadFailure(infoHash, entryName, fileName string, siz
 		}
 		r.recordBrokenFile(entryName, infoHash, fileName, entry.Protocol, entry.CliDebridIDs[fileName], reason, size)
 	case entry.IsTorrent():
+		if !r.shouldVerifyLiveTorrentFailure(entryName, fileName) {
+			return
+		}
 		go r.verifyLiveTorrentFailure(infoHash, entryName, fileName, size)
 	}
+}
+
+// liveVerifyCooldownWindow bounds how often verifyLiveTorrentFailure re-probes
+// the same file. A file under active playback can fail many chunked reads
+// within a second; without this, each one spawns its own CheckFile/ffprobe
+// goroutine hammering the mount and the debrid provider's API for a file
+// that's already known to be failing.
+const liveVerifyCooldownWindow = 30 * time.Second
+
+func (r *Repair) shouldVerifyLiveTorrentFailure(entryName, fileName string) bool {
+	key := entryName + "|" + fileName
+	now := time.Now()
+	if last, ok := r.liveVerifyCooldown.Load(key); ok && now.Sub(last) < liveVerifyCooldownWindow {
+		return false
+	}
+	r.liveVerifyCooldown.Store(key, now)
+	return true
 }
 
 // verifyLiveTorrentFailure re-probes one torrent file the same way a sweep
@@ -711,10 +739,27 @@ func (r *Repair) verifyLiveTorrentFailure(infoHash, entryName, fileName string, 
 		r.recordBrokenFile(entryName, infoHash, fileName, res.protocol, res.cliDebridID, res.reason, size)
 	case res.healthy:
 		r.clearBrokenFile(entryName, infoHash, fileName)
+	case res.reason == "media_probe_unavailable" && r.entryIsBad(infoHash):
+		// media_probe_unavailable means probeMountedMedia's own read of this
+		// file failed for "infrastructure" reasons — but that read goes
+		// through the exact same GetLink path that's already failing for
+		// this file in real playback. When the underlying entry has also
+		// given up re-inserting (entry.Bad), that's not an ambiguous result
+		// anymore: the verification is inconclusive only because the file is
+		// genuinely unreachable, not because of an unrelated transient
+		// hiccup. Three converging signals (the original live EIO, entry.Bad,
+		// and this re-probe's own read failing the same way) is enough to
+		// commit "broken" here, unlike a bare EIO alone.
+		r.recordBrokenFile(entryName, infoHash, fileName, res.protocol, res.cliDebridID, "entry_marked_bad", size)
 	default:
 		r.logger.Info().Str("entry", entryName).Str("file", fileName).Str("reason", res.reason).
 			Msg("verifyLiveTorrentFailure: re-probe inconclusive after live-read failure, leaving state unchanged")
 	}
+}
+
+func (r *Repair) entryIsBad(infoHash string) bool {
+	entry, err := r.manager.GetEntry(infoHash)
+	return err == nil && entry != nil && entry.Bad
 }
 
 // recordBrokenFile writes/updates a single BrokenFile entry for entryName.
