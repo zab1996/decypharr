@@ -3,12 +3,12 @@ package config
 import "testing"
 
 func TestRepairConfigMediaProbeEnabledDefaults(t *testing.T) {
-	var r RepairConfig // MediaProbeUsenet/MediaProbeDebrid unset, as on any config saved before this toggle existed
-	if !r.MediaProbeEnabled(true) {
-		t.Error("usenet media probe must default to enabled to preserve pre-toggle behavior")
+	var r RepairConfig // MediaProbeUsenet/MediaProbeDebrid unset
+	if r.MediaProbeEnabled(true) {
+		t.Error("usenet media probe must default to disabled — opt-in only")
 	}
 	if r.MediaProbeEnabled(false) {
-		t.Error("debrid media probe must default to disabled — it's new, opt-in behavior")
+		t.Error("debrid media probe must default to disabled — opt-in only")
 	}
 }
 

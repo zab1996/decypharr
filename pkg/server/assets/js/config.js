@@ -165,10 +165,8 @@ class ConfigManager {
         if ($('repair.strategy')) $('repair.strategy').value = repair.strategy || 'per_entry';
         if ($('repair.auto_repair')) $('repair.auto_repair').checked = !!repair.auto_repair;
         if ($('repair.skip_nzb_repair')) $('repair.skip_nzb_repair').checked = !!repair.skip_nzb_repair;
-        // media_probe_usenet is absent on configs saved before this toggle existed;
-        // it defaults on (matches the server's pre-toggle always-on behavior).
-        // media_probe_debrid defaults off — it's new, opt-in behavior.
-        if ($('repair.media_probe_usenet')) $('repair.media_probe_usenet').checked = repair.media_probe_usenet === undefined ? true : !!repair.media_probe_usenet;
+        // Both media probe toggles default off (opt-in only).
+        if ($('repair.media_probe_usenet')) $('repair.media_probe_usenet').checked = !!repair.media_probe_usenet;
         if ($('repair.media_probe_debrid')) $('repair.media_probe_debrid').checked = !!repair.media_probe_debrid;
     }
 

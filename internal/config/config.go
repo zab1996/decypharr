@@ -212,9 +212,8 @@ type RepairConfig struct {
 	StopSchedule string `json:"stop_schedule,omitempty"`
 
 	// MediaProbeUsenet/MediaProbeDebrid gate the ffprobe-based mounted-media
-	// playability probe (see probeMountedMedia) per protocol. Pointers so an
-	// absent/legacy config (no key on disk) is distinguishable from an explicit
-	// false: nil means "not set", handled by MediaProbeEnabled below.
+	// playability probe (see probeMountedMedia) per protocol. Both default to
+	// disabled (opt-in) — see MediaProbeEnabled.
 	MediaProbeUsenet *bool `json:"media_probe_usenet,omitempty"`
 	MediaProbeDebrid *bool `json:"media_probe_debrid,omitempty"`
 }
@@ -227,14 +226,12 @@ func (r RepairConfig) IsZero() bool {
 }
 
 // MediaProbeEnabled reports whether the mounted-media ffprobe check should run
-// for an entry of the given protocol. Usenet defaults to enabled (this probe
-// was unconditional for NZB entries before the toggle existed, so an absent
-// key on disk must not silently disable it for existing installs). Debrid
-// defaults to disabled: it's new behavior, opt-in only.
+// for an entry of the given protocol. Both usenet and debrid default to
+// disabled (nil) until explicitly turned on.
 func (r RepairConfig) MediaProbeEnabled(isNZB bool) bool {
 	if isNZB {
 		if r.MediaProbeUsenet == nil {
-			return true
+			return false
 		}
 		return *r.MediaProbeUsenet
 	}
