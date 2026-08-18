@@ -1,6 +1,7 @@
 package usenet
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -18,6 +19,15 @@ const (
 	metaFileExtension = ".meta"
 	metaDirName       = "meta"
 )
+
+// ErrNZBNotFound is returned by GetNZB specifically when the meta file
+// genuinely doesn't exist on disk (os.IsNotExist), as opposed to some other
+// transient read failure (permission, I/O, resource limits). Callers that
+// decide whether to permanently purge a queue entry based on this error
+// must check for this specific sentinel rather than treating any non-nil
+// error the same way - a transient failure isn't proof the entry is an
+// orphan.
+var ErrNZBNotFound = errors.New("nzb not found")
 
 const (
 	NZBStatusPending     = "pending"
@@ -143,7 +153,7 @@ func (s *NZBStorage) GetNZB(id string) (*storage.NZB, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("nzb not found: %s", id)
+			return nil, fmt.Errorf("%w: %s", ErrNZBNotFound, id)
 		}
 		return nil, fmt.Errorf("failed to read NZB meta file: %w", err)
 	}

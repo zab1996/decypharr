@@ -10,6 +10,7 @@ import (
 	"github.com/sirrobot01/decypharr/internal/config"
 	debridTypes "github.com/sirrobot01/decypharr/pkg/debrid/types"
 	"github.com/sirrobot01/decypharr/pkg/storage"
+	"github.com/sirrobot01/decypharr/pkg/usenet"
 	"github.com/sirrobot01/decypharr/pkg/usenet/parser"
 )
 
@@ -254,14 +255,26 @@ func (m *Manager) purgeOrphanNZBQueueEntries() {
 
 	purged := 0
 	for _, entry := range entries {
-		if _, err := m.usenet.GetNZB(entry.InfoHash); err != nil {
-			// Meta file missing — this job is unknown to the current instance.
-			if err := m.queue.DeleteEntryOnly(entry.InfoHash); err != nil {
-				m.logger.Warn().Err(err).Str("name", entry.Name).Str("id", entry.InfoHash).Msg("Failed to purge orphan NZB queue entry")
-			} else {
-				m.logger.Info().Str("name", entry.Name).Str("id", entry.InfoHash).Msg("Purged orphan NZB queue entry (meta file missing)")
-				purged++
-			}
+		_, err := m.usenet.GetNZB(entry.InfoHash)
+		if err == nil {
+			continue
+		}
+		if !errors.Is(err, usenet.ErrNZBNotFound) {
+			// Some other failure (permission, I/O, resource limits, etc.) -
+			// not proof the entry is actually an orphan. Startup does a big
+			// burst of disk I/O across every tracked entry at once, so a
+			// transient failure here is expected occasionally; purging on it
+			// would permanently delete a perfectly good queue entry with no
+			// way to recover it. Leave it alone and let the next tick retry.
+			m.logger.Warn().Err(err).Str("name", entry.Name).Str("id", entry.InfoHash).Msg("NZB meta file read failed (not confirmed missing) - leaving queue entry alone")
+			continue
+		}
+		// Meta file genuinely missing — this job is unknown to the current instance.
+		if err := m.queue.DeleteEntryOnly(entry.InfoHash); err != nil {
+			m.logger.Warn().Err(err).Str("name", entry.Name).Str("id", entry.InfoHash).Msg("Failed to purge orphan NZB queue entry")
+		} else {
+			m.logger.Info().Str("name", entry.Name).Str("id", entry.InfoHash).Msg("Purged orphan NZB queue entry (meta file missing)")
+			purged++
 		}
 	}
 
