@@ -210,12 +210,27 @@ type RepairConfig struct {
 	// fires mid-repair-sweep, AutoRepair decides what happens to whatever was
 	// already found broken: repaired if true, left alone if false.
 	StopSchedule string `json:"stop_schedule,omitempty"`
+
+	// MediaProbeUsenet gates the ffprobe-based mounted-media playability
+	// probe (see probeMountedMedia) for NZB entries. Pointer so an
+	// absent/legacy config (no key on disk) is distinguishable from an
+	// explicit false — nil defaults to disabled (opt-in only).
+	MediaProbeUsenet *bool `json:"media_probe_usenet,omitempty"`
 }
 
 func (r RepairConfig) IsZero() bool {
 	return !r.Enabled && r.Source == "" && r.Schedule == "" && r.Workers == 0 &&
 		r.NNTPConnectionPercent == 0 && r.Strategy == "" && r.RecheckInterval == "" && len(r.Arrs) == 0 &&
-		!r.AutoRepair && !r.SkipNZBRepair && r.StopSchedule == ""
+		!r.AutoRepair && !r.SkipNZBRepair && r.StopSchedule == "" && r.MediaProbeUsenet == nil
+}
+
+// MediaProbeEnabled reports whether the mounted-media ffprobe check should
+// run for NZB entries. Defaults to disabled until explicitly turned on.
+func (r RepairConfig) MediaProbeEnabled() bool {
+	if r.MediaProbeUsenet == nil {
+		return false
+	}
+	return *r.MediaProbeUsenet
 }
 
 type Config struct {
