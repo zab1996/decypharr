@@ -88,7 +88,6 @@ type Manager struct {
 
 	// Notifications service
 	Notifications *notifications.Service
-
 }
 
 // New creates a new Manager instance
@@ -155,7 +154,6 @@ func New() *Manager {
 		debridSpeedTestResults: xsync.NewMap[string, debridTypes.SpeedTestResult](),
 		activeStreams:          xsync.NewMap[string, *ActiveStream](),
 		processingEntries:      xsync.NewMap[string, struct{}](),
-
 	}
 
 	instance.init()
@@ -241,7 +239,7 @@ func (m *Manager) init() {
 }
 
 func (m *Manager) initUsenet() {
-	usenetClient, err := usenet.New()
+	usenetClient, err := usenet.New(m.storage.ProviderMetricsStore())
 	if err != nil {
 		m.logger.Warn().Msg("Usenet client not configured")
 		m.usenet = nil

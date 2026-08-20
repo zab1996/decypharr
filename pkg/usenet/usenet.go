@@ -19,6 +19,7 @@ import (
 	"github.com/sirrobot01/decypharr/internal/nntp"
 	"github.com/sirrobot01/decypharr/internal/utils"
 	"github.com/sirrobot01/decypharr/pkg/storage"
+	"github.com/sirrobot01/decypharr/pkg/storage/hybrid"
 	"github.com/sirrobot01/decypharr/pkg/usenet/fs"
 	"github.com/sirrobot01/decypharr/pkg/usenet/parser"
 	"github.com/sirrobot01/decypharr/pkg/usenet/types"
@@ -204,7 +205,7 @@ func fsKey(nzoID, filename string) string {
 }
 
 // New creates a new usenet instance
-func New() (*Usenet, error) {
+func New(metricStores ...*hybrid.Store) (*Usenet, error) {
 	cfg := config.Get()
 	usenetConfig := cfg.Usenet
 	if len(usenetConfig.Providers) == 0 {
@@ -224,7 +225,7 @@ func New() (*Usenet, error) {
 	}
 
 	// Create NNTP client with retry configuration
-	client, err := nntp.NewClient(cfg)
+	client, err := nntp.NewClient(cfg, metricStores...)
 	if err != nil {
 		return nil, err
 	}
@@ -648,6 +649,13 @@ func (u *Usenet) Close() error {
 		return true
 	})
 	u.fs.Clear()
+
+	// Active readers can report their final partial BODY byte count while the
+	// forced connection close is propagating. Flush once more after all reader
+	// cleanup has completed and before the manager closes persistent storage.
+	if u.nntp != nil {
+		u.nntp.FlushProviderMetrics()
+	}
 
 	u.logger.Info().Msg("Usenet closed")
 	return nil

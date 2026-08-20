@@ -1182,6 +1182,23 @@
 
                 nntpProviders.forEach(provider => {
                     const speedTest = provider.speed_test;
+					const health = provider.health || {status: 'unknown'};
+					const usage = provider.usage || {};
+					const healthStatus = health.status || 'unknown';
+					const healthClass = healthStatus === 'healthy'
+						? 'badge-success'
+						: (healthStatus === 'unhealthy' ? 'badge-error' : 'badge-ghost');
+					const healthIcon = healthStatus === 'healthy'
+						? 'bi-check-circle'
+						: (healthStatus === 'unhealthy' ? 'bi-x-circle' : 'bi-question-circle');
+					const checkedAt = health.checked_at
+						? new Date(health.checked_at).toLocaleString()
+						: 'Not checked yet';
+					const latencyText = health.latency_ms !== undefined && health.latency_ms !== null
+						? ` · ${health.latency_ms}ms`
+						: '';
+					const healthMessage = health.error || health.detail || '';
+					const healthMessageClass = health.error ? 'text-error' : 'text-warning';
                     let speedResultHtml = '';
                     if (speedTest && speedTest.tested_at) {
                         const testedAt = new Date(speedTest.tested_at).toLocaleTimeString();
@@ -1207,6 +1224,10 @@
                                         <p class="text-xs text-base-content/70">${provider.max_connections || 0} connections</p>
                                     </div>
                                     <div class="flex flex-col items-end gap-1">
+										<span class="badge ${healthClass} badge-sm gap-1">
+											<i class="bi ${healthIcon}"></i>
+											${healthStatus}
+										</span>
                                         ${speedResultHtml}
                                         <button
                                             class="btn btn-xs btn-ghost speed-test-btn"
@@ -1217,6 +1238,24 @@
                                         </button>
                                     </div>
                                 </div>
+								<div class="grid grid-cols-2 gap-2 mt-2 rounded bg-base-200 p-2">
+									<div>
+										<div class="text-xs text-base-content/60">Downloaded today</div>
+										<div class="text-sm font-medium">${window.decypharrUtils.formatBytes(usage.today_bytes || 0)}</div>
+									</div>
+									<div>
+										<div class="text-xs text-base-content/60">Rolling 30 days</div>
+										<div class="text-sm font-medium">${window.decypharrUtils.formatBytes(usage.rolling_30d_bytes || 0)}</div>
+									</div>
+								</div>
+								<div class="text-xs text-base-content/50 mt-2">
+									Health checked: ${checkedAt}${latencyText}
+								</div>
+								${healthMessage ? `
+									<div class="text-xs ${healthMessageClass} mt-1 break-words" title="${window.decypharrUtils.escapeHtml(healthMessage)}">
+										${window.decypharrUtils.escapeHtml(healthMessage)}
+									</div>
+								` : ''}
                                 <div id="speed-result-${provider.host.replace(/\./g, '-')}" class="text-xs mt-1"></div>
                             </div>
                         </div>
