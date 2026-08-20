@@ -35,14 +35,15 @@ const (
 	prewarmFraction = 0.20
 	prewarmMaxBytes = 256 * 1024 * 1024
 
-	// prewarmTimeout bounds a single prewarm fetch (always the same fixed
-	// 256MB max regardless of the source file's own size - see
-	// prewarmMaxBytes). Observed repeatedly in live testing: a real NZB
-	// download at ~4.75MB/s needs ~54s to pull the full 256MB, so even the
-	// 60s bump left little headroom for a slower connection. 120s gives
-	// real-world download speed variance enough room to actually finish
-	// instead of routinely landing partial.
-	prewarmTimeout = 120 * time.Second
+	// prewarmTimeout is a safety backstop, not a speed estimate: without it,
+	// a genuinely stalled download (network hiccup, provider outage) would
+	// leave the prewarm goroutine blocked on ReadAtContext forever, quietly
+	// holding a download slot/connection indefinitely. A background prewarm
+	// doesn't need to finish fast - it just needs to eventually give up if
+	// something's actually broken - so this is deliberately generous rather
+	// than tuned to match typical download speed for the (always capped at
+	// prewarmMaxBytes) fetch size.
+	prewarmTimeout = 5 * time.Minute
 
 	minPlausibleEpisodeSize = 20 * 1024 * 1024
 
