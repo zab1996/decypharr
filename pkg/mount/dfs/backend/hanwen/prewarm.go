@@ -26,7 +26,12 @@ const (
 	prewarmFraction = 0.20
 
 	// prewarmMaxBytes caps a single prewarm fetch regardless of episode size.
-	prewarmMaxBytes = 64 * 1024 * 1024 // 64MB
+	// A flat cap rather than bitrate-aware: for any real episode over ~1.25GB
+	// (virtually all of them - a typical 1080p episode alone is ~1.5GB), this
+	// cap is what actually limits the fetch, not prewarmFraction. Fine as a
+	// first pass; a future version could make this user-configurable instead
+	// of a hardcoded constant.
+	prewarmMaxBytes = 256 * 1024 * 1024 // 256MB
 
 	prewarmTimeout = 30 * time.Second
 
