@@ -35,12 +35,14 @@ const (
 	prewarmFraction = 0.20
 	prewarmMaxBytes = 256 * 1024 * 1024
 
-	// prewarmTimeout bounds a single prewarm fetch. Observed repeatedly in
-	// live testing: a real NZB download at ~4.75MB/s needs ~45s to pull a
-	// full 256MB fetch, so 30s consistently cut it off with ~30% still
-	// unfetched. 60s gives realistic download speeds enough room to finish
-	// the full fraction instead of routinely landing partial.
-	prewarmTimeout = 60 * time.Second
+	// prewarmTimeout bounds a single prewarm fetch (always the same fixed
+	// 256MB max regardless of the source file's own size - see
+	// prewarmMaxBytes). Observed repeatedly in live testing: a real NZB
+	// download at ~4.75MB/s needs ~54s to pull the full 256MB, so even the
+	// 60s bump left little headroom for a slower connection. 120s gives
+	// real-world download speed variance enough room to actually finish
+	// instead of routinely landing partial.
+	prewarmTimeout = 120 * time.Second
 
 	minPlausibleEpisodeSize = 20 * 1024 * 1024
 
