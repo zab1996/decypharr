@@ -37,6 +37,17 @@ type Handle struct {
 	// at most once per open file, even though Read() is called many times as
 	// playback crosses the threshold.
 	prewarmTriggered atomic.Bool
+
+	// bytesRead is the cumulative count of bytes actually returned by Read()
+	// on this Handle. A single-offset probe (ffprobe-style metadata/subtitle
+	// tools, decypharr's own repair engine, media-server scanners) seeks
+	// straight to a computed offset and reads one small chunk there - the
+	// offset alone can look like "70% through", but almost none of the file
+	// has actually been read. Real playback reads sequentially and racks up
+	// a large fraction of the file's total bytes over time. maybeTriggerPrewarm
+	// requires both a high offset AND a substantial cumulative read fraction,
+	// so a probe reading a few MB at one point can never satisfy it.
+	bytesRead atomic.Int64
 }
 
 // Read implements DFS streaming
@@ -99,7 +110,8 @@ func (fh *Handle) Read(ctx context.Context, dest []byte, off int64) (fuse.ReadRe
 	// maybeTriggerPrewarm is cheap to call on every read (an atomic bool CAS
 	// plus a percentage check) and does all the real work in a background
 	// goroutine, so this never adds read-path latency.
-	fh.maybeTriggerPrewarm(off + int64(n))
+	totalRead := fh.bytesRead.Add(int64(n))
+	fh.maybeTriggerPrewarm(off+int64(n), totalRead)
 
 	return fuse.ReadResultData(dest[:n]), 0
 }

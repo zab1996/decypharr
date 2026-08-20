@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/rs/zerolog"
 	"github.com/sirrobot01/decypharr/internal/logger"
 	"github.com/sirrobot01/decypharr/internal/utils"
 	"github.com/sirrobot01/decypharr/pkg/manager"
@@ -18,6 +19,18 @@ const (
 	// playtime — decypharr has no video-duration awareness, and doesn't need
 	// it here) playback must reach before the next episode gets prewarmed.
 	prewarmThreshold = 0.70
+
+	// minCumulativeReadFraction guards against single-offset probes (ffprobe
+	// metadata/subtitle-sync tools like Bazarr, decypharr's own repair engine,
+	// media-server library scanners) that seek straight to a computed offset
+	// and read one small chunk there. That alone can satisfy prewarmThreshold
+	// (the offset looks "70% through") even though almost none of the file
+	// was actually read - unlike real playback, which reads sequentially and
+	// racks up a large fraction of the file's total bytes over time. Requiring
+	// both a high offset AND a substantial cumulative read total means a probe
+	// reading a few MB at one point can never trigger this, regardless of
+	// which offset it happens to pick.
+	minCumulativeReadFraction = 0.50
 
 	// prewarmFraction is how much of the next episode gets fetched: enough to
 	// eliminate the "loading" moment when the user actually gets there,
@@ -43,7 +56,9 @@ const (
 // maybeTriggerPrewarm checks whether playback has crossed prewarmThreshold
 // and, if so and this is the first crossing for this Handle, kicks off a
 // background prewarm of the next episode. Safe to call on every read.
-func (fh *Handle) maybeTriggerPrewarm(readTo int64) {
+// totalRead is the cumulative bytes returned by Read() on this Handle so
+// far - see minCumulativeReadFraction for why this matters alongside readTo.
+func (fh *Handle) maybeTriggerPrewarm(readTo int64, totalRead int64) {
 	if fh.file == nil || fh.file.config == nil || !fh.file.config.PrewarmNextEpisode {
 		return
 	}
@@ -54,10 +69,20 @@ func (fh *Handle) maybeTriggerPrewarm(readTo int64) {
 	if size <= 0 || float64(readTo)/float64(size) < prewarmThreshold {
 		return
 	}
+	if float64(totalRead)/float64(size) < minCumulativeReadFraction {
+		return
+	}
 	if !fh.prewarmTriggered.CompareAndSwap(false, true) {
 		return
 	}
-	rlLogger := fh.logger
+	// A plain, non-deduped logger: maybeTriggerPrewarm's CAS above already
+	// guarantees this whole function runs at most once per open file, so
+	// there's no log-spam risk here that would call for fh.logger's
+	// rate-limiting. Using it directly was a bug - it dedupes by a fixed
+	// per-file key across ALL of that file's log calls regardless of
+	// message content, so every message here after the first within the
+	// same window was being silently swallowed as a "duplicate".
+	plainLog := logger.Default()
 	name := fh.file.info.Name()
 
 	if fh.file.vfs == nil {
@@ -81,32 +106,24 @@ func (fh *Handle) maybeTriggerPrewarm(readTo int64) {
 			current.Season = parentParsed.Season
 		}
 		if !current.IsTV || current.Season == 0 || current.EpStart == 0 {
-			if rlLogger != nil {
-				rlLogger.Debug().Str("file", name).Msg("Prewarm: not detected as a TV episode, skipping")
-			}
+			plainLog.Debug().Str("file", name).Msg("Prewarm: not detected as a TV episode, skipping")
 			return
 		}
 	}
 
-	if rlLogger != nil {
-		rlLogger.Info().Str("file", name).Int("season", current.Season).Int("episode", current.EpStart).
-			Msg("Prewarm: playback threshold crossed, looking for next episode")
-	}
+	plainLog.Info().Str("file", name).Int("season", current.Season).Int("episode", current.EpStart).
+		Msg("Prewarm: playback threshold crossed, looking for next episode")
 
 	next := findNextEpisode(mgr, current)
 	if next == nil {
-		if rlLogger != nil {
-			rlLogger.Info().Str("file", name).Int("season", current.Season).Int("episode", current.EpStart+1).
-				Msg("Prewarm: no matching next episode found among active torrents/jobs")
-		}
+		plainLog.Info().Str("file", name).Int("season", current.Season).Int("episode", current.EpStart+1).
+			Msg("Prewarm: no matching next episode found among active torrents/jobs")
 		return
 	}
 
 	vfsMgr := fh.file.vfs
-	if rlLogger != nil {
-		rlLogger.Info().Str("file", name).Str("nextFile", next.Name()).Msg("Prewarm: starting fetch of next episode")
-	}
-	go prewarmFile(vfsMgr, next, rlLogger)
+	plainLog.Info().Str("file", name).Str("nextFile", next.Name()).Msg("Prewarm: starting fetch of next episode")
+	go prewarmFile(vfsMgr, next, plainLog)
 }
 
 // findNextEpisode scans every active torrent/NZB job for a file matching the
@@ -170,12 +187,10 @@ func findNextEpisode(mgr *manager.Manager, current utils.ParsedName) *manager.Fi
 // of `info` into cache, reusing the exact same open/read/close path a real
 // playback request uses (vfs.Manager.GetFile + StreamingFile.ReadAtContext) —
 // no new fetch or caching logic, just triggering the existing one early.
-func prewarmFile(vfsMgr *vfs.Manager, info *manager.FileInfo, rlLogger *logger.RateLimitedEvent) {
+func prewarmFile(vfsMgr *vfs.Manager, info *manager.FileInfo, log zerolog.Logger) {
 	sf, err := vfsMgr.GetFile(info)
 	if err != nil {
-		if rlLogger != nil {
-			rlLogger.Warn().Str("file", info.Name()).Err(err).Msg("Prewarm: failed to open next episode")
-		}
+		log.Warn().Str("file", info.Name()).Err(err).Msg("Prewarm: failed to open next episode")
 		return
 	}
 	defer func() {
@@ -218,15 +233,12 @@ func prewarmFile(vfsMgr *vfs.Manager, info *manager.FileInfo, rlLogger *logger.R
 		}
 	}
 
-	if rlLogger == nil {
-		return
-	}
 	if readErr != nil && off < want {
-		rlLogger.Warn().Str("file", info.Name()).Int64("bytes", off).Int64("wanted", want).Err(readErr).
+		log.Warn().Str("file", info.Name()).Int64("bytes", off).Int64("wanted", want).Err(readErr).
 			Msg("Prewarm: stopped early")
 		return
 	}
-	rlLogger.Info().Str("file", info.Name()).Int64("bytes", off).Msg("Prewarm: complete")
+	log.Info().Str("file", info.Name()).Int64("bytes", off).Msg("Prewarm: complete")
 }
 
 // normalizeEpisodeTitle makes two title strings comparable regardless of
