@@ -20,17 +20,21 @@ const (
 	// it here) playback must reach before the next episode gets prewarmed.
 	prewarmThreshold = 0.70
 
-	// minCumulativeReadFraction guards against single-offset probes (ffprobe
+	// minElapsedForPrewarm guards against single-offset probes (ffprobe
 	// metadata/subtitle-sync tools like Bazarr, decypharr's own repair engine,
 	// media-server library scanners) that seek straight to a computed offset
-	// and read one small chunk there. That alone can satisfy prewarmThreshold
-	// (the offset looks "70% through") even though almost none of the file
-	// was actually read - unlike real playback, which reads sequentially and
-	// racks up a large fraction of the file's total bytes over time. Requiring
-	// both a high offset AND a substantial cumulative read total means a probe
-	// reading a few MB at one point can never trigger this, regardless of
-	// which offset it happens to pick.
-	minCumulativeReadFraction = 0.50
+	// and read there. Byte-volume-based guards were tried and both failed in
+	// practice: comparing against total file size falsely blocked genuine
+	// playback after a Handle reopen (a seek past the halfway point makes
+	// the remaining bytes physically incapable of ever reaching 50% of the
+	// whole file), while comparing against bytes-up-to-current-offset let a
+	// real scan through (some tools, e.g. audio-sync analysis, genuinely
+	// read a large contiguous span, not a single small chunk). Wall-clock
+	// time elapsed since the file was opened is the actually robust signal:
+	// a real viewer takes real minutes to reach 70% through any normal
+	// episode, while an automated tool reads gigabytes in seconds regardless
+	// of file size, bitrate, or how much of the file it happens to touch.
+	minElapsedForPrewarm = 3 * time.Minute
 
 	// prewarmFraction is how much of the next episode gets fetched: enough to
 	// eliminate the "loading" moment when the user actually gets there,
@@ -56,9 +60,7 @@ const (
 // maybeTriggerPrewarm checks whether playback has crossed prewarmThreshold
 // and, if so and this is the first crossing for this Handle, kicks off a
 // background prewarm of the next episode. Safe to call on every read.
-// totalRead is the cumulative bytes returned by Read() on this Handle so
-// far - see minCumulativeReadFraction for why this matters alongside readTo.
-func (fh *Handle) maybeTriggerPrewarm(readTo int64, totalRead int64) {
+func (fh *Handle) maybeTriggerPrewarm(readTo int64) {
 	if fh.file == nil || fh.file.config == nil || !fh.file.config.PrewarmNextEpisode {
 		return
 	}
@@ -69,7 +71,7 @@ func (fh *Handle) maybeTriggerPrewarm(readTo int64, totalRead int64) {
 	if size <= 0 || float64(readTo)/float64(size) < prewarmThreshold {
 		return
 	}
-	if float64(totalRead)/float64(size) < minCumulativeReadFraction {
+	if fh.openedAt.IsZero() || time.Since(fh.openedAt) < minElapsedForPrewarm {
 		return
 	}
 	if !fh.prewarmTriggered.CompareAndSwap(false, true) {
