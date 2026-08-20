@@ -420,6 +420,8 @@
         const errorEl = document.getElementById('error-stats');
         const refreshBtn = document.getElementById('refresh-stats');
         const retryBtn = document.getElementById('retry-stats');
+        let statsLoaded = false;
+        let statsRequestInFlight = false;
 
         // Tab switching
         const tabs = document.querySelectorAll('[role="tab"]');
@@ -1355,8 +1357,12 @@
             updateActiveStreams(stats.active_streams);
         }
 
-        function loadStats() {
-            showLoading();
+        function loadStats({showInitialLoading = false} = {}) {
+            if (statsRequestInFlight) return;
+            statsRequestInFlight = true;
+            if (showInitialLoading && !statsLoaded) {
+                showLoading();
+            }
 
             fetch(`${window.urlBase}debug/stats`)
                 .then(response => {
@@ -1367,11 +1373,17 @@
                 })
                 .then(stats => {
                     updateStats(stats);
+                    statsLoaded = true;
                     showContent();
                 })
                 .catch(error => {
                     console.error('Error loading stats:', error);
-                    showError(error.message || 'Failed to load statistics');
+                    if (!statsLoaded) {
+                        showError(error.message || 'Failed to load statistics');
+                    }
+                })
+                .finally(() => {
+                    statsRequestInFlight = false;
                 });
         }
 
@@ -1472,14 +1484,14 @@
         };
 
         // Event listeners
-        refreshBtn.addEventListener('click', loadStats);
-        retryBtn.addEventListener('click', loadStats);
+        refreshBtn.addEventListener('click', () => loadStats());
+        retryBtn.addEventListener('click', () => loadStats({showInitialLoading: true}));
 
         // Auto-refresh every 30 seconds
         setInterval(loadStats, 30000);
 
         // Initial load
-        loadStats();
+        loadStats({showInitialLoading: true});
     });
 </script>
 {{ end }}
