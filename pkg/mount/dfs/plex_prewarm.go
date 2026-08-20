@@ -140,6 +140,12 @@ type plexSeasonsResponse struct {
 	} `json:"MediaContainer"`
 }
 
+type plexEpisodeTarget struct {
+	Filename string
+	Season   int
+	Episode  int
+}
+
 // fetchSeasonRatingKey looks up a show's season-N ratingKey via the show's
 // own children (its season list). Used to cross a season boundary: a season
 // finale has no "next episode" within its own season's children, so finding
@@ -181,15 +187,19 @@ func fetchSeasonRatingKey(ctx context.Context, client *http.Client, plexURL, ple
 // season first (the common case), and if that comes up empty (a season
 // finale, or Plex's /children not covering it for some other reason), looks
 // up the next season's ratingKey and tries its episode 1 instead.
-func fetchNextEpisodeFilenameAcrossSeasons(ctx context.Context, client *http.Client, plexURL, plexToken string, s plexSession) string {
+func fetchNextEpisodeFilenameAcrossSeasons(ctx context.Context, client *http.Client, plexURL, plexToken string, s plexSession) plexEpisodeTarget {
 	if name := fetchNextEpisodeFilename(ctx, client, plexURL, plexToken, s.ParentRatingKey, s.Index+1); name != "" {
-		return name
+		return plexEpisodeTarget{Filename: name, Season: s.ParentIndex, Episode: s.Index + 1}
 	}
 	nextSeasonKey := fetchSeasonRatingKey(ctx, client, plexURL, plexToken, s.GrandparentRatingKey, s.ParentIndex+1)
 	if nextSeasonKey == "" {
-		return ""
+		return plexEpisodeTarget{}
 	}
-	return fetchNextEpisodeFilename(ctx, client, plexURL, plexToken, nextSeasonKey, 1)
+	name := fetchNextEpisodeFilename(ctx, client, plexURL, plexToken, nextSeasonKey, 1)
+	if name == "" {
+		return plexEpisodeTarget{}
+	}
+	return plexEpisodeTarget{Filename: name, Season: s.ParentIndex + 1, Episode: 1}
 }
 
 // findFileByBasename does an exact (case-insensitive) filename match across
@@ -271,18 +281,22 @@ func pollPlexSessionsOnce(ctx context.Context, client *http.Client, plexURL, ple
 			log.Info().Str("show", s.GrandparentTitle).Int("season", s.ParentIndex).Int("episode", s.Index).
 				Msg("Prewarm: Plex session crossed threshold, looking for next episode")
 
-			// Primary path: ask Plex directly for the next episode's exact
-			// filename and match it verbatim - Plex resolves "next episode"
-			// from its own metadata, no title parsing/normalization involved,
-			// so it can't suffer the class of mismatch bug title matching can
-			// (already hit twice tonight: a season-pack folder name PTT
-			// couldn't parse, and a "(US)"-style disambiguator Plex keeps but
-			// release filenames drop). Crosses a season boundary automatically
-			// (season finale -> next season's episode 1) via the show's own
-			// season list.
+			// Primary path: ask Plex which episode comes next. First try its
+			// basename verbatim; cli_debrid may have renamed the symlink Plex
+			// sees while cli_mount still tracks the original release filename,
+			// so fall back to matching the parsed show/season/episode identity.
 			var next *manager.FileInfo
-			if nextName := fetchNextEpisodeFilenameAcrossSeasons(ctx, client, plexURL, plexToken, s); nextName != "" {
-				next = findFileByBasename(mgr, nextName)
+			target := fetchNextEpisodeFilenameAcrossSeasons(ctx, client, plexURL, plexToken, s)
+			if target.Filename != "" {
+				next = findFileByBasename(mgr, target.Filename)
+				if next == nil {
+					parsed := utils.ParseTorrentName(target.Filename)
+					title := parsed.Title
+					if title == "" {
+						title = s.GrandparentTitle
+					}
+					next = findEpisode(mgr, title, target.Season, target.Episode)
+				}
 			}
 			// Fallback: title/season/episode-number matching, for when the
 			// direct Plex lookup fails (network hiccup, etc.) rather than
@@ -290,26 +304,23 @@ func pollPlexSessionsOnce(ctx context.Context, client *http.Client, plexURL, ple
 			// first, then season+1 episode 1 for the same season-boundary
 			// case the primary path handles.
 			if next == nil {
-				current := utils.ParsedName{
-					Title:   s.GrandparentTitle,
-					Season:  s.ParentIndex,
-					EpStart: s.Index,
-					IsTV:    true,
-				}
-				next = findNextEpisode(mgr, current)
+				next = findEpisode(mgr, s.GrandparentTitle, s.ParentIndex, s.Index+1)
 			}
 			if next == nil {
-				nextSeason := utils.ParsedName{
-					Title:   s.GrandparentTitle,
-					Season:  s.ParentIndex + 1,
-					EpStart: 0, // findNextEpisode wants EpStart+1, so 0 -> episode 1
-					IsTV:    true,
-				}
-				next = findNextEpisode(mgr, nextSeason)
+				next = findEpisode(mgr, s.GrandparentTitle, s.ParentIndex+1, 1)
 			}
 			if next == nil {
-				log.Info().Str("show", s.GrandparentTitle).Int("season", s.ParentIndex).Int("episode", s.Index+1).
-					Msg("Prewarm: no matching next episode found among active torrents/jobs")
+				// A temporary Plex/API or job-list miss must not suppress this
+				// session for the full six-hour successful-prewarm TTL.
+				seen.forget(s.RatingKey)
+				event := log.Info().Str("show", s.GrandparentTitle)
+				if target.Filename != "" {
+					event = event.Int("target_season", target.Season).Int("target_episode", target.Episode).
+						Str("plex_filename", target.Filename)
+				} else {
+					event = event.Str("attempted", fmt.Sprintf("S%02dE%02d and S%02dE01", s.ParentIndex, s.Index+1, s.ParentIndex+1))
+				}
+				event.Msg("Prewarm: no matching next episode found among active torrents/jobs")
 				continue
 			}
 			log.Info().Str("show", s.GrandparentTitle).Str("nextFile", next.Name()).Msg("Prewarm: starting fetch of next episode")
@@ -360,6 +371,12 @@ func (p *prewarmedSessions) markIfNew(key string) bool {
 	return true
 }
 
+func (p *prewarmedSessions) forget(key string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.entries, key)
+}
+
 func (p *prewarmedSessions) evictExpired() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -378,9 +395,11 @@ func (p *prewarmedSessions) evictExpired() {
 // is a file in a DIFFERENT torrent) with one pass — there's no cheaper
 // special case for season packs since both shapes turn up in the same scan.
 func findNextEpisode(mgr *manager.Manager, current utils.ParsedName) *manager.FileInfo {
-	wantTitle := normalizeEpisodeTitle(current.Title)
-	wantSeason := current.Season
-	wantEp := current.EpStart + 1
+	return findEpisode(mgr, current.Title, current.Season, current.EpStart+1)
+}
+
+func findEpisode(mgr *manager.Manager, showTitle string, wantSeason, wantEp int) *manager.FileInfo {
+	wantTitle := normalizeEpisodeTitle(showTitle)
 
 	_, torrents := mgr.GetEntryChildren(manager.EntryAllFolder)
 	for _, entry := range torrents {
@@ -420,24 +439,28 @@ func findNextEpisode(mgr *manager.Manager, current utils.ParsedName) *manager.Fi
 				continue
 			}
 			cp := utils.ParseTorrentName(child.Name())
-			title := cp.Title
-			if title == "" {
-				title = entryParsed.Title
-			}
-			season := cp.Season
-			if season == 0 {
-				season = entryParsed.Season
-			}
-			if !cp.IsTV || season != wantSeason || cp.EpStart != wantEp {
-				continue
-			}
-			if wantTitle != "" && normalizeEpisodeTitle(title) != wantTitle {
+			if !matchesEpisodeIdentity(wantTitle, wantSeason, wantEp, entryParsed, cp) {
 				continue
 			}
 			return child
 		}
 	}
 	return nil
+}
+
+func matchesEpisodeIdentity(wantTitle string, wantSeason, wantEp int, entryParsed, fileParsed utils.ParsedName) bool {
+	title := fileParsed.Title
+	if title == "" {
+		title = entryParsed.Title
+	}
+	season := fileParsed.Season
+	if season == 0 {
+		season = entryParsed.Season
+	}
+	if !fileParsed.IsTV || season != wantSeason || fileParsed.EpStart != wantEp {
+		return false
+	}
+	return wantTitle == "" || normalizeEpisodeTitle(title) == wantTitle
 }
 
 // prewarmFile fetches the first prewarmFraction (capped at maxBytes,
@@ -512,6 +535,18 @@ func normalizeEpisodeTitle(s string) string {
 	// every match for any show whose Plex title carries this kind of suffix.
 	if i := strings.IndexByte(s, '('); i >= 0 {
 		s = s[:i]
+	}
+	// Release names commonly include the show's year immediately before the
+	// SxxExx marker ("Sons of Anarchy 2008 S03E05"). ParseTorrentName keeps
+	// that year in Title, while Plex exposes the canonical title without it.
+	// Strip only a plausible trailing year when other title text precedes it,
+	// preserving numeric show titles such as "1923" and "The 100".
+	fields := strings.Fields(strings.TrimSpace(s))
+	if len(fields) > 1 {
+		last := fields[len(fields)-1]
+		if len(last) == 4 && last >= "1900" && last <= "2099" {
+			s = strings.Join(fields[:len(fields)-1], " ")
+		}
 	}
 	s = strings.ToLower(s)
 	var b strings.Builder
