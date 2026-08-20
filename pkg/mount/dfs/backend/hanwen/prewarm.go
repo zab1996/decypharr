@@ -145,9 +145,21 @@ func findNextEpisode(mgr *manager.Manager, current utils.ParsedName) *manager.Fi
 			continue
 		}
 		entryParsed := utils.ParseTorrentName(entry.Name())
-		// Fast pre-filter: if the torrent's own name parses to a title and it
-		// clearly isn't the same show, skip drilling into its file list.
-		if entryParsed.Title != "" && wantTitle != "" && normalizeEpisodeTitle(entryParsed.Title) != wantTitle {
+		// Fast pre-filter: skip on a confident season mismatch only - NOT on
+		// title, and NOT on IsTV/season-zero. A season-pack folder name with
+		// no episode number in it (e.g. "Show.S09.2021.WEB-DL...", no "E##")
+		// is a real, common release-naming pattern that the parser can fail
+		// on: it may not recognize "S09" as a season marker at all without an
+		// accompanying episode number, dumping it straight into Title as
+		// garbage text instead ("Show S09 2021"). That garbled title would
+		// then never match the correctly-parsed per-file title and the whole
+		// folder gets skipped before ever reaching its children - even though
+		// the files inside parse perfectly fine on their own and would have
+		// matched correctly. Only a *confident* season-number mismatch is
+		// treated as authoritative here; everything else drills into
+		// children, where the accurate per-file title/season/episode check
+		// (below) is the real decider.
+		if entryParsed.IsTV && entryParsed.Season != 0 && entryParsed.Season != wantSeason {
 			continue
 		}
 
