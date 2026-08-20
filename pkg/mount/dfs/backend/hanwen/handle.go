@@ -32,6 +32,11 @@ type Handle struct {
 	closed     atomic.Bool
 	logger     *logger.RateLimitedEvent
 	lastAccess atomic.Int64
+
+	// prewarmTriggered ensures the next-episode prewarm (see prewarm.go) fires
+	// at most once per open file, even though Read() is called many times as
+	// playback crosses the threshold.
+	prewarmTriggered atomic.Bool
 }
 
 // Read implements DFS streaming
@@ -89,6 +94,13 @@ func (fh *Handle) Read(ctx context.Context, dest []byte, off int64) (fuse.ReadRe
 			return nil, syscall.EIO
 		}
 	}
+
+	// Fire the next-episode prewarm once playback crosses the threshold.
+	// maybeTriggerPrewarm is cheap to call on every read (an atomic bool CAS
+	// plus a percentage check) and does all the real work in a background
+	// goroutine, so this never adds read-path latency.
+	fh.maybeTriggerPrewarm(off + int64(n))
+
 	return fuse.ReadResultData(dest[:n]), 0
 }
 

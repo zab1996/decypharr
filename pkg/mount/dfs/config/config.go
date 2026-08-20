@@ -39,10 +39,13 @@ type FuseConfig struct {
 
 	Retries int
 
+	// PrewarmNextEpisode — see internal/config.DFS.PrewarmNextEpisode.
+	PrewarmNextEpisode bool
+
 	// File system settings
-	UID                uint32
-	GID                uint32
-	Umask              uint32
+	UID   uint32
+	GID   uint32
+	Umask uint32
 }
 
 // DefaultFuseConfig returns a streaming-optimized default configuration
@@ -52,8 +55,8 @@ func DefaultFuseConfig() *FuseConfig {
 		DaemonTimeout:        time.Second * 10, // Longer timeout for reliability
 		CacheExpiry:          24 * time.Hour,   // Longer cache for popular content
 		CacheCleanupInterval: 5 * time.Minute,  // More frequent cleanup
-		ChunkSize:     4 * 1024 * 1024,  // 4MB chunks (matches beta baseline)
-		ReadAheadSize: 16 * 1024 * 1024, // 16MB read-ahead (4 chunks ahead)
+		ChunkSize:            4 * 1024 * 1024,  // 4MB chunks (matches beta baseline)
+		ReadAheadSize:        16 * 1024 * 1024, // 16MB read-ahead (4 chunks ahead)
 
 		Retries: 3,
 
@@ -125,6 +128,9 @@ func ParseFuseConfig() *FuseConfig {
 			fuseConfig.DropBehindMargin = size
 		}
 	}
+
+	fuseConfig.PrewarmNextEpisode = cfg.PrewarmNextEpisode
+
 	// Otherwise keep the default (4) from DefaultFuseConfig()
 	fuseConfig.UID = cfg.UID
 	fuseConfig.GID = cfg.GID

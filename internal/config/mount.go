@@ -72,10 +72,18 @@ type DFS struct {
 
 	DaemonTimeout string `json:"daemon_timeout,omitempty"` // Time after which the FUSE daemon will exit if idle
 
+	// PrewarmNextEpisode, when true, watches TV playback and — once a stream
+	// crosses ~70% of its own length — proactively fetches the first ~20% of
+	// the next episode (found across any active torrent/NZB job, not just
+	// season packs) into cache, so it starts up faster if the user continues.
+	// Off by default: it's speculative bandwidth/cache usage that only pays
+	// off if the user actually continues watching.
+	PrewarmNextEpisode bool `json:"prewarm_next_episode,omitempty"`
+
 	// File system settings
-	UID                uint32 `json:"uid,omitempty"`                 // User ID for mounted files
-	GID                uint32 `json:"gid,omitempty"`                 // Group ID for mounted files
-	Umask              string `json:"umask,omitempty"`               // File permissions mask
+	UID   uint32 `json:"uid,omitempty"`   // User ID for mounted files
+	GID   uint32 `json:"gid,omitempty"`   // Group ID for mounted files
+	Umask string `json:"umask,omitempty"` // File permissions mask
 }
 
 // DiskCacheSizeBytes resolves the DFS on-disk cache budget in bytes. Empty or
