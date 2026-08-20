@@ -52,6 +52,9 @@ func (fh *Handle) maybeTriggerPrewarm(readTo int64) {
 	if !fh.prewarmTriggered.CompareAndSwap(false, true) {
 		return
 	}
+	rlLogger := fh.logger
+	name := fh.file.info.Name()
+
 	if fh.file.vfs == nil {
 		return
 	}
@@ -60,7 +63,7 @@ func (fh *Handle) maybeTriggerPrewarm(readTo int64) {
 		return
 	}
 
-	current := utils.ParseTorrentName(fh.file.info.Name())
+	current := utils.ParseTorrentName(name)
 	if !current.IsTV || current.Season == 0 || current.EpStart == 0 {
 		// Fall back to the parent torrent's name — a season-pack's own file
 		// name sometimes lacks a title (e.g. a bare "S01E05.mkv"), so borrow
@@ -73,17 +76,31 @@ func (fh *Handle) maybeTriggerPrewarm(readTo int64) {
 			current.Season = parentParsed.Season
 		}
 		if !current.IsTV || current.Season == 0 || current.EpStart == 0 {
-			return // genuinely not a TV episode (or unparseable) - nothing to prewarm
+			if rlLogger != nil {
+				rlLogger.Debug().Str("file", name).Msg("Prewarm: not detected as a TV episode, skipping")
+			}
+			return
 		}
+	}
+
+	if rlLogger != nil {
+		rlLogger.Info().Str("file", name).Int("season", current.Season).Int("episode", current.EpStart).
+			Msg("Prewarm: playback threshold crossed, looking for next episode")
 	}
 
 	next := findNextEpisode(mgr, current)
 	if next == nil {
+		if rlLogger != nil {
+			rlLogger.Info().Str("file", name).Int("season", current.Season).Int("episode", current.EpStart+1).
+				Msg("Prewarm: no matching next episode found among active torrents/jobs")
+		}
 		return
 	}
 
 	vfsMgr := fh.file.vfs
-	rlLogger := fh.logger
+	if rlLogger != nil {
+		rlLogger.Info().Str("file", name).Str("nextFile", next.Name()).Msg("Prewarm: starting fetch of next episode")
+	}
 	go prewarmFile(vfsMgr, next, rlLogger)
 }
 
@@ -151,6 +168,9 @@ func findNextEpisode(mgr *manager.Manager, current utils.ParsedName) *manager.Fi
 func prewarmFile(vfsMgr *vfs.Manager, info *manager.FileInfo, rlLogger *logger.RateLimitedEvent) {
 	sf, err := vfsMgr.GetFile(info)
 	if err != nil {
+		if rlLogger != nil {
+			rlLogger.Warn().Str("file", info.Name()).Err(err).Msg("Prewarm: failed to open next episode")
+		}
 		return
 	}
 	defer func() {
@@ -176,6 +196,7 @@ func prewarmFile(vfsMgr *vfs.Manager, info *manager.FileInfo, rlLogger *logger.R
 	const chunk = 8 * 1024 * 1024 // 8MB per read call
 	buf := make([]byte, chunk)
 	var off int64
+	var readErr error
 	for off < want {
 		readSize := chunk
 		if remaining := want - off; remaining < int64(readSize) {
@@ -184,6 +205,7 @@ func prewarmFile(vfsMgr *vfs.Manager, info *manager.FileInfo, rlLogger *logger.R
 		n, rerr := sf.ReadAtContext(ctx, buf[:readSize], off)
 		off += int64(n)
 		if rerr != nil {
+			readErr = rerr
 			break
 		}
 		if n == 0 {
@@ -191,9 +213,15 @@ func prewarmFile(vfsMgr *vfs.Manager, info *manager.FileInfo, rlLogger *logger.R
 		}
 	}
 
-	if rlLogger != nil {
-		rlLogger.Info().Str("file", info.Name()).Int64("bytes", off).Msg("Prewarmed next episode")
+	if rlLogger == nil {
+		return
 	}
+	if readErr != nil && off < want {
+		rlLogger.Warn().Str("file", info.Name()).Int64("bytes", off).Int64("wanted", want).Err(readErr).
+			Msg("Prewarm: stopped early")
+		return
+	}
+	rlLogger.Info().Str("file", info.Name()).Int64("bytes", off).Msg("Prewarm: complete")
 }
 
 // normalizeEpisodeTitle makes two title strings comparable regardless of
