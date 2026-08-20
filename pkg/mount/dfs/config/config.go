@@ -39,10 +39,11 @@ type FuseConfig struct {
 
 	Retries int
 
-	// PrewarmNextEpisode/PlexURL/PlexToken — see internal/config.DFS.
+	// PrewarmNextEpisode/PlexURL/PlexToken/PrewarmMaxBytes — see internal/config.DFS.
 	PrewarmNextEpisode bool
 	PlexURL            string
 	PlexToken          string
+	PrewarmMaxBytes    int64
 
 	// File system settings
 	UID   uint32
@@ -134,6 +135,7 @@ func ParseFuseConfig() *FuseConfig {
 	fuseConfig.PrewarmNextEpisode = cfg.PrewarmNextEpisode
 	fuseConfig.PlexURL = cfg.PlexURL
 	fuseConfig.PlexToken = cfg.PlexToken
+	fuseConfig.PrewarmMaxBytes = cfg.PrewarmMaxSizeBytes()
 
 	// Otherwise keep the default (4) from DefaultFuseConfig()
 	fuseConfig.UID = cfg.UID

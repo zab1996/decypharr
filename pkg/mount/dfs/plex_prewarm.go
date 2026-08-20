@@ -32,8 +32,10 @@ const (
 	plexPollInterval  = 20 * time.Second
 	plexPrewarmThresh = 0.70
 
+	// prewarmFraction is how much of the next episode gets fetched, before
+	// the flat FuseConfig.PrewarmMaxBytes cap (configurable, default 256MB)
+	// is applied - see prewarmFile.
 	prewarmFraction = 0.20
-	prewarmMaxBytes = 256 * 1024 * 1024
 
 	// prewarmTimeout is a safety backstop, not a speed estimate: without it,
 	// a genuinely stalled download (network hiccup, provider outage) would
@@ -41,8 +43,7 @@ const (
 	// holding a download slot/connection indefinitely. A background prewarm
 	// doesn't need to finish fast - it just needs to eventually give up if
 	// something's actually broken - so this is deliberately generous rather
-	// than tuned to match typical download speed for the (always capped at
-	// prewarmMaxBytes) fetch size.
+	// than tuned to match typical download speed for the fetch size.
 	prewarmTimeout = 5 * time.Minute
 
 	minPlausibleEpisodeSize = 20 * 1024 * 1024
@@ -178,14 +179,15 @@ func (m *Manager) startPlexPrewarmPoller(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				pollPlexSessionsOnce(ctx, client, m.config.PlexURL, m.config.PlexToken, m.manager, m.vfs, seen, log)
+				pollPlexSessionsOnce(ctx, client, m.config.PlexURL, m.config.PlexToken, m.manager, m.vfs, seen, log, m.config.PrewarmMaxBytes)
 			}
 		}
 	}()
-	log.Info().Str("plex_url", m.config.PlexURL).Dur("interval", plexPollInterval).Msg("Prewarm: started Plex session poller")
+	log.Info().Str("plex_url", m.config.PlexURL).Dur("interval", plexPollInterval).
+		Int64("max_bytes", m.config.PrewarmMaxBytes).Msg("Prewarm: started Plex session poller")
 }
 
-func pollPlexSessionsOnce(ctx context.Context, client *http.Client, plexURL, plexToken string, mgr *manager.Manager, vfsMgr *vfs.Manager, seen *prewarmedSessions, log zerolog.Logger) {
+func pollPlexSessionsOnce(ctx context.Context, client *http.Client, plexURL, plexToken string, mgr *manager.Manager, vfsMgr *vfs.Manager, seen *prewarmedSessions, log zerolog.Logger, maxBytes int64) {
 	sessions, err := fetchPlexSessions(ctx, client, plexURL, plexToken)
 	if err != nil {
 		log.Warn().Err(err).Msg("Prewarm: failed to fetch Plex sessions")
@@ -234,7 +236,7 @@ func pollPlexSessionsOnce(ctx context.Context, client *http.Client, plexURL, ple
 				continue
 			}
 			log.Info().Str("show", s.GrandparentTitle).Str("nextFile", next.Name()).Msg("Prewarm: starting fetch of next episode")
-			go prewarmFile(vfsMgr, next, log)
+			go prewarmFile(vfsMgr, next, log, maxBytes)
 		}
 	}
 }
@@ -361,11 +363,12 @@ func findNextEpisode(mgr *manager.Manager, current utils.ParsedName) *manager.Fi
 	return nil
 }
 
-// prewarmFile fetches the first prewarmFraction (capped at prewarmMaxBytes)
-// of `info` into cache, reusing the exact same open/read/close path a real
-// playback request uses (vfs.Manager.GetFile + StreamingFile.ReadAtContext) —
-// no new fetch or caching logic, just triggering the existing one early.
-func prewarmFile(vfsMgr *vfs.Manager, info *manager.FileInfo, log zerolog.Logger) {
+// prewarmFile fetches the first prewarmFraction (capped at maxBytes,
+// FuseConfig.PrewarmMaxBytes - configurable, default 256MB) of `info` into
+// cache, reusing the exact same open/read/close path a real playback
+// request uses (vfs.Manager.GetFile + StreamingFile.ReadAtContext) — no new
+// fetch or caching logic, just triggering the existing one early.
+func prewarmFile(vfsMgr *vfs.Manager, info *manager.FileInfo, log zerolog.Logger, maxBytes int64) {
 	sf, err := vfsMgr.GetFile(info)
 	if err != nil {
 		log.Warn().Str("file", info.Name()).Err(err).Msg("Prewarm: failed to open next episode")
@@ -381,8 +384,8 @@ func prewarmFile(vfsMgr *vfs.Manager, info *manager.FileInfo, log zerolog.Logger
 		return
 	}
 	want := int64(float64(size) * prewarmFraction)
-	if want > prewarmMaxBytes {
-		want = prewarmMaxBytes
+	if maxBytes > 0 && want > maxBytes {
+		want = maxBytes
 	}
 	if want <= 0 {
 		return

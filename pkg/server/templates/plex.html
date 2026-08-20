@@ -58,6 +58,19 @@
                     </label>
                 </div>
 
+                <div class="form-control">
+                    <label class="label" for="plexMaxSize">
+                        <span class="label-text font-medium">Prewarm size cap</span>
+                    </label>
+                    <input type="text" id="plexMaxSize" placeholder="256MB"
+                           class="input input-bordered w-full" />
+                    <label class="label">
+                        <span class="label-text-alt opacity-60">
+                            Max bytes fetched ahead of time per next-episode, e.g. "256MB", "1GB". Leave blank for the 256MB default.
+                        </span>
+                    </label>
+                </div>
+
                 <div class="flex items-center gap-3 pt-2">
                     <button type="submit" class="btn btn-primary">
                         <i class="bi bi-check2 mr-1"></i>Save
@@ -80,6 +93,7 @@
         document.getElementById('prewarmEnabled').checked = !!dfs.prewarm_next_episode;
         document.getElementById('plexUrl').value = dfs.plex_url || '';
         document.getElementById('plexToken').value = dfs.plex_token || '';
+        document.getElementById('plexMaxSize').value = dfs.prewarm_max_size || '';
         return cfg;
     }
 
@@ -97,6 +111,7 @@
             cfg.mount.dfs.prewarm_next_episode = document.getElementById('prewarmEnabled').checked;
             cfg.mount.dfs.plex_url = document.getElementById('plexUrl').value.trim();
             cfg.mount.dfs.plex_token = document.getElementById('plexToken').value.trim();
+            cfg.mount.dfs.prewarm_max_size = document.getElementById('plexMaxSize').value.trim();
 
             const res = await fetch(urlBase + 'api/config', {
                 method: 'POST',
