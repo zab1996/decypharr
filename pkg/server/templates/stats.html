@@ -1199,6 +1199,12 @@
 					const latencyText = health.latency_ms !== undefined && health.latency_ms !== null
 						? ` · ${health.latency_ms}ms`
 						: '';
+					const speedTestText = speedTest && !speedTest.error && speedTest.speed_mbps > 0
+						? ` · Last test ${speedTest.speed_mbps.toFixed(1)} MB/s`
+						: '';
+					const usageWindowEnd = usage.window_end
+						? new Date(`${usage.window_end}T00:00:00`).toLocaleDateString()
+						: '';
 					const healthMessage = health.error || health.detail || '';
 					const healthMessageClass = health.error ? 'text-error' : 'text-warning';
                     let speedResultHtml = '';
@@ -1246,12 +1252,13 @@
 										<div class="text-sm font-medium">${window.decypharrUtils.formatBytes(usage.today_bytes || 0)}</div>
 									</div>
 									<div>
-										<div class="text-xs text-base-content/60">Rolling 30 days</div>
-										<div class="text-sm font-medium">${window.decypharrUtils.formatBytes(usage.rolling_30d_bytes || 0)}</div>
+										<div class="text-xs text-base-content/60">Current 30-day period</div>
+										<div class="text-sm font-medium">${window.decypharrUtils.formatBytes(usage.period_30d_bytes || 0)}</div>
+										${usageWindowEnd ? `<div class="text-xs text-base-content/50">Resets after ${usageWindowEnd}</div>` : ''}
 									</div>
 								</div>
 								<div class="text-xs text-base-content/50 mt-2">
-									Health checked: ${checkedAt}${latencyText}
+									Health checked: ${checkedAt}${latencyText}${speedTestText}
 								</div>
 								${healthMessage ? `
 									<div class="text-xs ${healthMessageClass} mt-1 break-words" title="${window.decypharrUtils.escapeHtml(healthMessage)}">

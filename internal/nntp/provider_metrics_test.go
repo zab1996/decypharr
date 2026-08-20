@@ -51,7 +51,7 @@ func TestCanonicalProviderKeyIncludesEndpointAndTLS(t *testing.T) {
 	}
 }
 
-func TestProviderUsagePersistsConcurrentExactThirtyDayWindow(t *testing.T) {
+func TestProviderUsagePersistsConcurrentAndResetsEveryThirtyDays(t *testing.T) {
 	store := newMetricsStore(t)
 	provider := config.UsenetProvider{Host: "news.example.com", Port: 563, SSL: true}
 	providerKey := canonicalProviderKey(provider)
@@ -59,13 +59,10 @@ func TestProviderUsagePersistsConcurrentExactThirtyDayWindow(t *testing.T) {
 	now := func() time.Time { return clock }
 	m := newProviderMonitorWithClock(nil, []config.UsenetProvider{provider}, store, now)
 
-	m.RecordUsage(providerKey, 11) // Expires once the clock reaches Jan 31.
+	m.RecordUsage(providerKey, 11)
 	m.Flush()
-	clock = time.Date(2026, time.January, 2, 12, 0, 0, 0, time.Local)
-	m.RecordUsage(providerKey, 22) // Exact first day of Jan 2-Jan 31 window.
-	m.Flush()
-	clock = time.Date(2026, time.January, 31, 12, 0, 0, 0, time.Local)
-	m.RecordUsage(providerKey, 33)
+	clock = time.Date(2026, time.January, 30, 12, 0, 0, 0, time.Local)
+	m.RecordUsage(providerKey, 22)
 
 	const goroutines = 32
 	const increments = 100
@@ -81,21 +78,62 @@ func TestProviderUsagePersistsConcurrentExactThirtyDayWindow(t *testing.T) {
 	}
 	wg.Wait()
 	m.Flush()
+	_, usage := m.Stats(provider)
+	if got, want := usage.Period30dBytes, int64(11+22+goroutines*increments); got != want {
+		t.Fatalf("first-period bytes = %d, want %d", got, want)
+	}
+	if usage.WindowStart != "2026-01-01" || usage.WindowEnd != "2026-01-30" {
+		t.Fatalf("unexpected first period: %+v", usage)
+	}
 
-	if store.Exists(providerStoreKey("usage", providerKey, "2026-01-01")) {
-		t.Fatal("expired usage bucket was not pruned")
+	clock = time.Date(2026, time.January, 31, 12, 0, 0, 0, time.Local)
+	m.RecordUsage(providerKey, 33)
+	m.Flush()
+
+	for _, expiredDate := range []string{"2026-01-01", "2026-01-30"} {
+		if store.Exists(providerStoreKey("usage", providerKey, expiredDate)) {
+			t.Fatalf("expired usage bucket %s was not pruned", expiredDate)
+		}
 	}
 
 	reloaded := newProviderMonitorWithClock(nil, []config.UsenetProvider{provider}, store, now)
-	_, usage := reloaded.Stats(provider)
-	if got, want := usage.TodayBytes, int64(33+goroutines*increments); got != want {
+	_, usage = reloaded.Stats(provider)
+	if got, want := usage.TodayBytes, int64(33); got != want {
 		t.Fatalf("today bytes = %d, want %d", got, want)
 	}
-	if got, want := usage.Rolling30dBytes, int64(22+33+goroutines*increments); got != want {
-		t.Fatalf("rolling bytes = %d, want %d", got, want)
+	if got, want := usage.Period30dBytes, int64(33); got != want {
+		t.Fatalf("reset-period bytes = %d, want %d", got, want)
 	}
-	if usage.WindowStart != "2026-01-02" || usage.WindowEnd != "2026-01-31" {
+	if usage.WindowStart != "2026-01-31" || usage.WindowEnd != "2026-03-01" {
 		t.Fatalf("unexpected window: %+v", usage)
+	}
+}
+
+func TestProviderUsageUpgradeSeedsPeriodFromExistingData(t *testing.T) {
+	store := newMetricsStore(t)
+	provider := config.UsenetProvider{Host: "news.example.com", Port: 563, SSL: true}
+	providerKey := canonicalProviderKey(provider)
+	for date, bytes := range map[string]int64{"2026-08-10": 40, "2026-08-19": 60} {
+		data, err := json.Marshal(persistedUsage{ProviderKey: providerKey, Date: date, Bytes: bytes})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.Put(providerStoreKey("usage", providerKey, date), data, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	clock := time.Date(2026, time.August, 20, 12, 0, 0, 0, time.Local)
+	now := func() time.Time { return clock }
+	m := newProviderMonitorWithClock(nil, []config.UsenetProvider{provider}, store, now)
+	_, usage := m.Stats(provider)
+	if usage.WindowStart != "2026-08-10" || usage.WindowEnd != "2026-09-08" || usage.Period30dBytes != 100 {
+		t.Fatalf("existing data did not seed the period: %+v", usage)
+	}
+
+	reloaded := newProviderMonitorWithClock(nil, []config.UsenetProvider{provider}, store, now)
+	_, persisted := reloaded.Stats(provider)
+	if persisted.WindowStart != usage.WindowStart || persisted.Period30dBytes != usage.Period30dBytes {
+		t.Fatalf("usage period did not persist: first=%+v reloaded=%+v", usage, persisted)
 	}
 }
 
@@ -118,8 +156,27 @@ func TestProviderHealthPersistsAndUnknownDefaults(t *testing.T) {
 	if unknown.Status != "unknown" || unknown.CheckedAt != "" {
 		t.Fatalf("unexpected default health: %+v", unknown)
 	}
-	if usage.TodayBytes != 0 || usage.Rolling30dBytes != 0 {
+	if usage.TodayBytes != 0 || usage.Period30dBytes != 0 {
 		t.Fatalf("unexpected default usage: %+v", usage)
+	}
+}
+
+func TestProviderSpeedTestPersists(t *testing.T) {
+	store := newMetricsStore(t)
+	provider := config.UsenetProvider{Host: "news.example.com", Port: 563, SSL: true}
+	firstClient := &Client{speedTestResults: xsync.NewMap[string, SpeedTestResult]()}
+	first := newProviderMonitor(firstClient, []config.UsenetProvider{provider}, store)
+	want := SpeedTestResult{
+		Provider: provider.Host, SpeedMBps: 12.5, LatencyMs: 48, BytesRead: 1024,
+		TestedAt: time.Date(2026, time.August, 20, 16, 20, 55, 0, time.Local),
+	}
+	first.setSpeedTest(provider, want)
+
+	secondClient := &Client{speedTestResults: xsync.NewMap[string, SpeedTestResult]()}
+	_ = newProviderMonitor(secondClient, []config.UsenetProvider{provider}, store)
+	got, ok := secondClient.GetSpeedTestResult(provider.Host)
+	if !ok || got.Provider != want.Provider || got.SpeedMBps != want.SpeedMBps || got.LatencyMs != want.LatencyMs || !got.TestedAt.Equal(want.TestedAt) {
+		t.Fatalf("speed test did not persist: got=%+v ok=%v want=%+v", got, ok, want)
 	}
 }
 

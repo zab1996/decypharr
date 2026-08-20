@@ -31,10 +31,10 @@ type ProviderHealth struct {
 }
 
 type ProviderUsage struct {
-	TodayBytes      int64  `json:"today_bytes"`
-	Rolling30dBytes int64  `json:"rolling_30d_bytes"`
-	WindowStart     string `json:"window_start"`
-	WindowEnd       string `json:"window_end"`
+	TodayBytes     int64  `json:"today_bytes"`
+	Period30dBytes int64  `json:"period_30d_bytes"`
+	WindowStart    string `json:"window_start"`
+	WindowEnd      string `json:"window_end"`
 }
 
 type persistedHealth struct {
@@ -48,15 +48,25 @@ type persistedUsage struct {
 	Bytes       int64  `json:"bytes"`
 }
 
+type persistedUsagePeriod struct {
+	Start string `json:"start"`
+}
+
+type persistedSpeedTest struct {
+	ProviderKey string          `json:"provider_key"`
+	Result      SpeedTestResult `json:"result"`
+}
+
 type providerMonitor struct {
 	client    *Client
 	providers []config.UsenetProvider
 	store     *hybrid.Store
 
-	mu     sync.RWMutex
-	health map[string]ProviderHealth
-	usage  map[string]map[string]int64
-	dirty  map[string]map[string]struct{}
+	mu          sync.RWMutex
+	health      map[string]ProviderHealth
+	usage       map[string]map[string]int64
+	dirty       map[string]map[string]struct{}
+	periodStart string
 
 	now            func() time.Time
 	healthInterval time.Duration
@@ -118,6 +128,11 @@ func (m *providerMonitor) load() {
 	}
 	if err := m.store.ForEach(func(key string, value []byte) error {
 		switch {
+		case key == "usage_period/start":
+			var period persistedUsagePeriod
+			if err := json.Unmarshal(value, &period); err == nil {
+				m.periodStart = period.Start
+			}
 		case strings.HasPrefix(key, "health/"):
 			var record persistedHealth
 			if err := json.Unmarshal(value, &record); err == nil && record.ProviderKey != "" {
@@ -131,12 +146,88 @@ func (m *providerMonitor) load() {
 				}
 				m.usage[record.ProviderKey][record.Date] = record.Bytes
 			}
+		case strings.HasPrefix(key, "speed/"):
+			var record persistedSpeedTest
+			if err := json.Unmarshal(value, &record); err == nil && record.ProviderKey != "" && record.Result.Provider != "" && m.client != nil {
+				m.client.speedTestResults.Store(record.Result.Provider, record.Result)
+			}
 		}
 		return nil
 	}); err != nil && m.client != nil {
 		m.client.logger.Warn().Err(err).Msg("Failed to load provider metrics")
 	}
+	m.ensureUsagePeriod()
 	m.prune(true)
+}
+
+func (m *providerMonitor) setSpeedTest(provider config.UsenetProvider, result SpeedTestResult) {
+	if m.store == nil {
+		return
+	}
+	providerKey := canonicalProviderKey(provider)
+	data, err := json.Marshal(persistedSpeedTest{ProviderKey: providerKey, Result: result})
+	if err == nil {
+		err = m.store.Put(providerStoreKey("speed", providerKey), data, &hybrid.EntryMeta{
+			Category: "provider_speed_test", Provider: providerKey,
+		})
+	}
+	if err != nil && m.client != nil {
+		m.client.logger.Warn().Err(err).Str("provider", providerKey).Msg("Failed to persist provider speed test")
+	}
+}
+
+func (m *providerMonitor) ensureUsagePeriod() {
+	today := m.now().In(time.Local)
+	todayText := today.Format("2006-01-02")
+
+	m.mu.Lock()
+	startText := m.periodStart
+	if startText == "" {
+		// Preserve already-collected usage when upgrading from the original
+		// rolling-window implementation by anchoring at its earliest date.
+		for _, dates := range m.usage {
+			for date := range dates {
+				if startText == "" || date < startText {
+					startText = date
+				}
+			}
+		}
+		if startText == "" {
+			startText = todayText
+		}
+	}
+	start, err := time.ParseInLocation("2006-01-02", startText, time.Local)
+	if err != nil || today.Before(start) {
+		start = time.Date(today.Year(), today.Month(), today.Day(), 0, 0, 0, 0, time.Local)
+	}
+	for !today.Before(start.AddDate(0, 0, providerUsageDays)) {
+		start = start.AddDate(0, 0, providerUsageDays)
+	}
+	newStart := start.Format("2006-01-02")
+	changed := newStart != m.periodStart
+	m.periodStart = newStart
+	m.mu.Unlock()
+
+	if changed && m.store != nil {
+		if data, marshalErr := json.Marshal(persistedUsagePeriod{Start: newStart}); marshalErr == nil {
+			if putErr := m.store.Put("usage_period/start", data, &hybrid.EntryMeta{Category: "provider_usage_period"}); putErr != nil && m.client != nil {
+				m.client.logger.Warn().Err(putErr).Msg("Failed to persist provider usage period")
+			}
+		}
+	}
+}
+
+func (m *providerMonitor) usageWindow() (string, string) {
+	m.ensureUsagePeriod()
+	m.mu.RLock()
+	startText := m.periodStart
+	m.mu.RUnlock()
+	start, err := time.ParseInLocation("2006-01-02", startText, time.Local)
+	if err != nil {
+		start = m.now().In(time.Local)
+		startText = start.Format("2006-01-02")
+	}
+	return startText, start.AddDate(0, 0, providerUsageDays-1).Format("2006-01-02")
 }
 
 func (m *providerMonitor) Start() {
@@ -259,6 +350,7 @@ func (m *providerMonitor) RecordUsage(providerKey string, bytes int64) {
 	if bytes <= 0 || providerKey == "" {
 		return
 	}
+	m.ensureUsagePeriod()
 	date := m.now().In(time.Local).Format("2006-01-02")
 	m.mu.Lock()
 	if m.usage[providerKey] == nil {
@@ -320,9 +412,7 @@ func (m *providerMonitor) Flush() {
 }
 
 func (m *providerMonitor) prune(deletePersisted bool) {
-	today := m.now().In(time.Local)
-	windowStart := today.AddDate(0, 0, -(providerUsageDays - 1)).Format("2006-01-02")
-	windowEnd := today.Format("2006-01-02")
+	windowStart, windowEnd := m.usageWindow()
 	type staleRecord struct{ providerKey, date string }
 	var stale []staleRecord
 	m.mu.Lock()
@@ -356,16 +446,16 @@ func (m *providerMonitor) Stats(provider config.UsenetProvider) (ProviderHealth,
 	providerKey := canonicalProviderKey(provider)
 	now := m.now().In(time.Local)
 	today := now.Format("2006-01-02")
-	windowStart := now.AddDate(0, 0, -(providerUsageDays - 1)).Format("2006-01-02")
+	windowStart, windowEnd := m.usageWindow()
 	health := ProviderHealth{Status: "unknown"}
-	usage := ProviderUsage{WindowStart: windowStart, WindowEnd: today}
+	usage := ProviderUsage{WindowStart: windowStart, WindowEnd: windowEnd}
 	m.mu.RLock()
 	if current, ok := m.health[providerKey]; ok {
 		health = current
 	}
 	for date, bytes := range m.usage[providerKey] {
-		if date >= windowStart && date <= today {
-			usage.Rolling30dBytes += bytes
+		if date >= windowStart && date <= windowEnd {
+			usage.Period30dBytes += bytes
 			if date == today {
 				usage.TodayBytes = bytes
 			}

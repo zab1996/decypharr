@@ -1411,6 +1411,12 @@ func (c *Client) SpeedTest(ctx context.Context, providerHost string, messageID s
 		c.speedTestResults.Store(providerHost, result)
 		return result
 	}
+	defer func() {
+		c.speedTestResults.Store(providerHost, result)
+		if c.providerMonitor != nil {
+			c.providerMonitor.setSpeedTest(*targetProvider, result)
+		}
+	}()
 
 	// Create connection
 	conn, err := c.createConnection(ctx, *targetProvider)
@@ -1422,7 +1428,6 @@ func (c *Client) SpeedTest(ctx context.Context, providerHost string, messageID s
 				Error: sanitizeProviderError(err, *targetProvider),
 			})
 		}
-		c.speedTestResults.Store(providerHost, result)
 		return result
 	}
 	defer func(conn *Connection) {
@@ -1444,7 +1449,6 @@ func (c *Client) SpeedTest(ctx context.Context, providerHost string, messageID s
 			}
 			c.providerMonitor.setHealth(canonicalProviderKey(*targetProvider), health)
 		}
-		c.speedTestResults.Store(providerHost, result)
 		return result
 	}
 	result.LatencyMs = time.Since(pingStart).Milliseconds()
@@ -1457,7 +1461,6 @@ func (c *Client) SpeedTest(ctx context.Context, providerHost string, messageID s
 
 	// If no messageID provided, just return latency
 	if messageID == "" {
-		c.speedTestResults.Store(providerHost, result)
 		return result
 	}
 
@@ -1468,7 +1471,6 @@ func (c *Client) SpeedTest(ctx context.Context, providerHost string, messageID s
 
 	if err != nil {
 		result.Error = fmt.Sprintf("download failed: %v", err)
-		c.speedTestResults.Store(providerHost, result)
 		return result
 	}
 
@@ -1479,7 +1481,6 @@ func (c *Client) SpeedTest(ctx context.Context, providerHost string, messageID s
 		result.SpeedMBps = float64(result.BytesRead) / downloadDuration.Seconds() / (1024 * 1024)
 	}
 
-	c.speedTestResults.Store(providerHost, result)
 	return result
 }
 
