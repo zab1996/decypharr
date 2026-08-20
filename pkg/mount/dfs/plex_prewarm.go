@@ -62,14 +62,15 @@ type plexSessionsResponse struct {
 }
 
 type plexSession struct {
-	RatingKey        string `json:"ratingKey"`
-	ParentRatingKey  string `json:"parentRatingKey"` // season's ratingKey - used to list the season's episodes
-	Type             string `json:"type"`            // "episode", "movie", etc.
-	GrandparentTitle string `json:"grandparentTitle"`
-	ParentIndex      int    `json:"parentIndex"` // season number
-	Index            int    `json:"index"`       // episode number
-	ViewOffset       int64  `json:"viewOffset"`  // ms
-	Duration         int64  `json:"duration"`    // ms
+	RatingKey            string `json:"ratingKey"`
+	ParentRatingKey      string `json:"parentRatingKey"`      // season's ratingKey - used to list the season's episodes
+	GrandparentRatingKey string `json:"grandparentRatingKey"` // show's ratingKey - used to list its seasons, for crossing a season boundary
+	Type                 string `json:"type"`                 // "episode", "movie", etc.
+	GrandparentTitle     string `json:"grandparentTitle"`
+	ParentIndex          int    `json:"parentIndex"` // season number
+	Index                int    `json:"index"`       // episode number
+	ViewOffset           int64  `json:"viewOffset"`  // ms
+	Duration             int64  `json:"duration"`    // ms
 }
 
 // plexChildrenResponse is the shape of /library/metadata/{ratingKey}/children.
@@ -125,6 +126,70 @@ func fetchNextEpisodeFilename(ctx context.Context, client *http.Client, plexURL,
 		}
 	}
 	return ""
+}
+
+// plexSeasonsResponse is the shape of /library/metadata/{showRatingKey}/children
+// - a show's own children are its seasons, each with an "index" (season
+// number) and its own ratingKey (used to then list that season's episodes).
+type plexSeasonsResponse struct {
+	MediaContainer struct {
+		Metadata []struct {
+			Index     int    `json:"index"`
+			RatingKey string `json:"ratingKey"`
+		} `json:"Metadata"`
+	} `json:"MediaContainer"`
+}
+
+// fetchSeasonRatingKey looks up a show's season-N ratingKey via the show's
+// own children (its season list). Used to cross a season boundary: a season
+// finale has no "next episode" within its own season's children, so finding
+// season+1's episode 1 requires first resolving season+1's own ratingKey.
+func fetchSeasonRatingKey(ctx context.Context, client *http.Client, plexURL, plexToken, showRatingKey string, wantSeasonIndex int) string {
+	if showRatingKey == "" {
+		return ""
+	}
+	url := strings.TrimRight(plexURL, "/") + "/library/metadata/" + showRatingKey + "/children"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return ""
+	}
+	req.Header.Set("X-Plex-Token", plexToken)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return ""
+	}
+	var parsed plexSeasonsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+		return ""
+	}
+	for _, season := range parsed.MediaContainer.Metadata {
+		if season.Index == wantSeasonIndex {
+			return season.RatingKey
+		}
+	}
+	return ""
+}
+
+// fetchNextEpisodeFilenameAcrossSeasons is the season-boundary-aware wrapper
+// around fetchNextEpisodeFilename: tries episode+1 within the current
+// season first (the common case), and if that comes up empty (a season
+// finale, or Plex's /children not covering it for some other reason), looks
+// up the next season's ratingKey and tries its episode 1 instead.
+func fetchNextEpisodeFilenameAcrossSeasons(ctx context.Context, client *http.Client, plexURL, plexToken string, s plexSession) string {
+	if name := fetchNextEpisodeFilename(ctx, client, plexURL, plexToken, s.ParentRatingKey, s.Index+1); name != "" {
+		return name
+	}
+	nextSeasonKey := fetchSeasonRatingKey(ctx, client, plexURL, plexToken, s.GrandparentRatingKey, s.ParentIndex+1)
+	if nextSeasonKey == "" {
+		return ""
+	}
+	return fetchNextEpisodeFilename(ctx, client, plexURL, plexToken, nextSeasonKey, 1)
 }
 
 // findFileByBasename does an exact (case-insensitive) filename match across
@@ -212,15 +277,18 @@ func pollPlexSessionsOnce(ctx context.Context, client *http.Client, plexURL, ple
 			// so it can't suffer the class of mismatch bug title matching can
 			// (already hit twice tonight: a season-pack folder name PTT
 			// couldn't parse, and a "(US)"-style disambiguator Plex keeps but
-			// release filenames drop).
+			// release filenames drop). Crosses a season boundary automatically
+			// (season finale -> next season's episode 1) via the show's own
+			// season list.
 			var next *manager.FileInfo
-			if nextName := fetchNextEpisodeFilename(ctx, client, plexURL, plexToken, s.ParentRatingKey, s.Index+1); nextName != "" {
+			if nextName := fetchNextEpisodeFilenameAcrossSeasons(ctx, client, plexURL, plexToken, s); nextName != "" {
 				next = findFileByBasename(mgr, nextName)
 			}
 			// Fallback: title/season/episode-number matching, for when the
-			// direct Plex lookup fails (network hiccup, season boundary
-			// Plex's /children call doesn't cover, etc.) rather than giving
-			// up entirely.
+			// direct Plex lookup fails (network hiccup, etc.) rather than
+			// giving up entirely. Tries the current season's next episode
+			// first, then season+1 episode 1 for the same season-boundary
+			// case the primary path handles.
 			if next == nil {
 				current := utils.ParsedName{
 					Title:   s.GrandparentTitle,
@@ -229,6 +297,15 @@ func pollPlexSessionsOnce(ctx context.Context, client *http.Client, plexURL, ple
 					IsTV:    true,
 				}
 				next = findNextEpisode(mgr, current)
+			}
+			if next == nil {
+				nextSeason := utils.ParsedName{
+					Title:   s.GrandparentTitle,
+					Season:  s.ParentIndex + 1,
+					EpStart: 0, // findNextEpisode wants EpStart+1, so 0 -> episode 1
+					IsTV:    true,
+				}
+				next = findNextEpisode(mgr, nextSeason)
 			}
 			if next == nil {
 				log.Info().Str("show", s.GrandparentTitle).Int("season", s.ParentIndex).Int("episode", s.Index+1).
