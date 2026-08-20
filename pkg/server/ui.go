@@ -168,6 +168,20 @@ func (s *Server) RepairHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (s *Server) PlexHandler(w http.ResponseWriter, r *http.Request) {
+	cfg := config.Get()
+	data := map[string]interface{}{
+		"URLBase":    cfg.URLBase,
+		"Page":       "plex",
+		"Title":      "Plex",
+		"SetupError": cfg.SetupError(),
+	}
+	err := s.templates.ExecuteTemplate(w, "layout", data)
+	if err != nil {
+		s.logger.Warn().Err(err).Msg("error rendering /plex template")
+	}
+}
+
 func (s *Server) ConfigHandler(w http.ResponseWriter, r *http.Request) {
 	cfg := config.Get()
 	data := map[string]interface{}{

@@ -77,7 +77,7 @@ func (f *File) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, s
 		if err != nil {
 			return nil, 0, syscall.ENOENT
 		}
-		fh := &Handle{file: f, sidecarFd: fd, logger: f.logger, openedAt: time.Now()}
+		fh := &Handle{file: f, sidecarFd: fd, logger: f.logger}
 		fh.lastAccess.Store(time.Now().Unix())
 		return fh, fuse.FOPEN_DIRECT_IO, 0
 	}
@@ -96,7 +96,6 @@ func (f *File) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, s
 		file:       f,
 		streamFile: reader,
 		logger:     f.logger,
-		openedAt:   time.Now(),
 	}
 	fh.lastAccess.Store(time.Now().Unix())
 	return fh, 0, 0

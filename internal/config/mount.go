@@ -72,13 +72,29 @@ type DFS struct {
 
 	DaemonTimeout string `json:"daemon_timeout,omitempty"` // Time after which the FUSE daemon will exit if idle
 
-	// PrewarmNextEpisode, when true, watches TV playback and — once a stream
-	// crosses ~70% of its own length — proactively fetches the first ~20% of
-	// the next episode (found across any active torrent/NZB job, not just
-	// season packs) into cache, so it starts up faster if the user continues.
-	// Off by default: it's speculative bandwidth/cache usage that only pays
-	// off if the user actually continues watching.
+	// PrewarmNextEpisode, when true, polls Plex's /status/sessions API for
+	// real active playback and — once a session crosses ~70% of its
+	// duration — proactively fetches the first ~20% of the next episode
+	// (found across any active torrent/NZB job, not just season packs) into
+	// cache, so it starts up faster if the user continues. Requires PlexURL
+	// and PlexToken to be set - without them this is a no-op. Off by
+	// default: it's speculative bandwidth/cache usage that only pays off if
+	// the user actually continues watching.
+	//
+	// A prior version of this feature inferred "playback" from raw FUSE
+	// read offsets on the mount, with no way to reliably tell a real viewer
+	// apart from any other tool that reads files (subtitle-sync scanners,
+	// decypharr's own repair engine, media-server library scans) - it kept
+	// producing false positives no matter how the heuristic was tuned.
+	// Querying Plex directly for its own reported playback state sidesteps
+	// that whole class of problem: only genuine Plex sessions can trigger
+	// this now.
 	PrewarmNextEpisode bool `json:"prewarm_next_episode,omitempty"`
+
+	// PlexURL and PlexToken authenticate the /status/sessions poll used by
+	// PrewarmNextEpisode. Not used for anything else.
+	PlexURL   string `json:"plex_url,omitempty"`
+	PlexToken string `json:"plex_token,omitempty"`
 
 	// File system settings
 	UID   uint32 `json:"uid,omitempty"`   // User ID for mounted files

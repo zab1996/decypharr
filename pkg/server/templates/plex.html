@@ -1,0 +1,118 @@
+{{ define "plex" }}
+<div class="space-y-6">
+    {{ if .SetupError }}
+    <div role="alert" class="alert alert-warning">
+        <i class="bi bi-exclamation-triangle text-xl"></i>
+        <div>
+            <h3 class="font-bold">Configuration Required</h3>
+            <div class="text-sm">Your configuration is incomplete ({{ .SetupError }}). Please complete the setup in the
+                <a href="{{.URLBase}}settings" class="link link-hover font-semibold">Settings page</a>.
+            </div>
+        </div>
+    </div>
+    {{ end }}
+
+    <div class="card bg-base-100 shadow-xl">
+        <div class="card-body">
+            <h2 class="card-title text-2xl">
+                <i class="bi bi-play-circle mr-2 text-primary"></i>Plex
+            </h2>
+            <p class="text-sm opacity-70 mt-1">
+                Connect decypharr to Plex to prewarm the next episode's cache while a real viewer is watching.
+                decypharr polls Plex's own <code>/status/sessions</code> API for genuine active playback — once a
+                session crosses 70% through an episode, the next episode (if tracked by decypharr) gets its first
+                ~20% fetched into cache ahead of time, so it starts up faster if the viewer continues.
+            </p>
+
+            <form id="plexForm" class="mt-6 space-y-4 max-w-xl">
+                <div class="form-control">
+                    <label class="label cursor-pointer justify-start gap-3">
+                        <input type="checkbox" id="prewarmEnabled" class="toggle toggle-primary" />
+                        <span class="label-text font-medium">Enable next-episode prewarm</span>
+                    </label>
+                </div>
+
+                <div class="form-control">
+                    <label class="label" for="plexUrl">
+                        <span class="label-text font-medium">Plex Server URL</span>
+                    </label>
+                    <input type="text" id="plexUrl" placeholder="http://192.168.1.10:32400"
+                           class="input input-bordered w-full" />
+                    <label class="label">
+                        <span class="label-text-alt opacity-60">Reachable from decypharr, not necessarily from your browser.</span>
+                    </label>
+                </div>
+
+                <div class="form-control">
+                    <label class="label" for="plexToken">
+                        <span class="label-text font-medium">Plex Token</span>
+                    </label>
+                    <input type="password" id="plexToken" placeholder="X-Plex-Token"
+                           class="input input-bordered w-full" autocomplete="off" />
+                    <label class="label">
+                        <span class="label-text-alt opacity-60">
+                            <a class="link link-hover" href="https://support.plex.tv/articles/204059436-finding-an-authentication-token-x-plex-token/" target="_blank" rel="noopener">
+                                How to find your Plex token
+                            </a>
+                        </span>
+                    </label>
+                </div>
+
+                <div class="flex items-center gap-3 pt-2">
+                    <button type="submit" class="btn btn-primary">
+                        <i class="bi bi-check2 mr-1"></i>Save
+                    </button>
+                    <span id="plexSaveStatus" class="text-sm opacity-70"></span>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+
+<script>
+(function () {
+    const urlBase = '{{.URLBase}}';
+
+    async function loadConfig() {
+        const res = await fetch(urlBase + 'api/config');
+        const cfg = await res.json();
+        const dfs = (cfg.mount && cfg.mount.dfs) || {};
+        document.getElementById('prewarmEnabled').checked = !!dfs.prewarm_next_episode;
+        document.getElementById('plexUrl').value = dfs.plex_url || '';
+        document.getElementById('plexToken').value = dfs.plex_token || '';
+        return cfg;
+    }
+
+    let currentConfig = null;
+    loadConfig().then(cfg => { currentConfig = cfg; });
+
+    document.getElementById('plexForm').addEventListener('submit', async function (e) {
+        e.preventDefault();
+        const statusEl = document.getElementById('plexSaveStatus');
+        statusEl.textContent = 'Saving…';
+        try {
+            const cfg = currentConfig || await loadConfig();
+            cfg.mount = cfg.mount || {};
+            cfg.mount.dfs = cfg.mount.dfs || {};
+            cfg.mount.dfs.prewarm_next_episode = document.getElementById('prewarmEnabled').checked;
+            cfg.mount.dfs.plex_url = document.getElementById('plexUrl').value.trim();
+            cfg.mount.dfs.plex_token = document.getElementById('plexToken').value.trim();
+
+            const res = await fetch(urlBase + 'api/config', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(cfg)
+            });
+            if (!res.ok) {
+                const text = await res.text();
+                throw new Error(text || ('HTTP ' + res.status));
+            }
+            statusEl.textContent = 'Saved — restart may be required to apply.';
+            currentConfig = cfg;
+        } catch (err) {
+            statusEl.textContent = 'Failed to save: ' + err.message;
+        }
+    });
+})();
+</script>
+{{ end }}

@@ -39,6 +39,7 @@ func (s *Server) WebRoutes() http.Handler {
 		r.Get("/browse", s.BrowseHandler)
 		r.Get("/download", s.DownloadHandler)
 		r.Get("/repair", s.RepairHandler)
+		r.Get("/plex", s.PlexHandler)
 		r.Get("/stats", s.StatsHandler)
 		r.Get("/settings", s.ConfigHandler)
 		r.Get("/logs", s.LogsHandler)
