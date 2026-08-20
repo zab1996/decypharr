@@ -1209,14 +1209,16 @@
 					const healthMessageClass = health.error ? 'text-error' : 'text-warning';
                     let speedResultHtml = '';
                     if (speedTest && speedTest.tested_at) {
-                        const testedAt = new Date(speedTest.tested_at).toLocaleTimeString();
-                        if (speedTest.error) {
-                            speedResultHtml = `<span class="text-error text-xs"><i class="bi bi-x-circle"></i> Error</span>`;
-                        } else {
-                            const speedStr = speedTest.speed_mbps > 0
-                                ? `${speedTest.speed_mbps.toFixed(1)} MB/s`
-                                : `${speedTest.latency_ms}ms`;
-                            speedResultHtml = `<span class="text-success text-xs"><i class="bi bi-check-circle"></i> ${speedStr}</span>`;
+						const speedTestAgeMs = Date.now() - new Date(speedTest.tested_at).getTime();
+						if (speedTestAgeMs >= 0 && speedTestAgeMs < 60000) {
+							if (speedTest.error) {
+								speedResultHtml = `<span class="text-error text-xs"><i class="bi bi-x-circle"></i> Error</span>`;
+							} else {
+								const speedStr = speedTest.speed_mbps > 0
+									? `${speedTest.speed_mbps.toFixed(1)} MB/s`
+									: `${speedTest.latency_ms}ms`;
+								speedResultHtml = `<span class="text-success text-xs"><i class="bi bi-check-circle"></i> ${speedStr}</span>`;
+							}
                         }
                     }
 
