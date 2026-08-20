@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"path"
 	"strings"
 	"sync"
 	"time"
@@ -58,12 +59,97 @@ type plexSessionsResponse struct {
 
 type plexSession struct {
 	RatingKey        string `json:"ratingKey"`
-	Type             string `json:"type"` // "episode", "movie", etc.
+	ParentRatingKey  string `json:"parentRatingKey"` // season's ratingKey - used to list the season's episodes
+	Type             string `json:"type"`            // "episode", "movie", etc.
 	GrandparentTitle string `json:"grandparentTitle"`
 	ParentIndex      int    `json:"parentIndex"` // season number
 	Index            int    `json:"index"`       // episode number
 	ViewOffset       int64  `json:"viewOffset"`  // ms
 	Duration         int64  `json:"duration"`    // ms
+}
+
+// plexChildrenResponse is the shape of /library/metadata/{ratingKey}/children.
+type plexChildrenResponse struct {
+	MediaContainer struct {
+		Metadata []struct {
+			Index int `json:"index"`
+			Media []struct {
+				Part []struct {
+					File string `json:"file"`
+				} `json:"Part"`
+			} `json:"Media"`
+		} `json:"Metadata"`
+	} `json:"MediaContainer"`
+}
+
+// fetchNextEpisodeFilename asks Plex directly for the next episode within
+// the same season (via the season's own ratingKey) and returns just the
+// basename of the file Plex itself reports for it - authoritative, since
+// Plex resolves "next episode" from its own TheTVDB/TMDB-backed metadata,
+// not from parsing a release filename. Returns "" if Plex doesn't have a
+// next episode in this season (e.g. a season finale) or the lookup fails.
+func fetchNextEpisodeFilename(ctx context.Context, client *http.Client, plexURL, plexToken, seasonRatingKey string, wantIndex int) string {
+	if seasonRatingKey == "" {
+		return ""
+	}
+	url := strings.TrimRight(plexURL, "/") + "/library/metadata/" + seasonRatingKey + "/children"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return ""
+	}
+	req.Header.Set("X-Plex-Token", plexToken)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return ""
+	}
+	var parsed plexChildrenResponse
+	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+		return ""
+	}
+	for _, ep := range parsed.MediaContainer.Metadata {
+		if ep.Index != wantIndex {
+			continue
+		}
+		if len(ep.Media) > 0 && len(ep.Media[0].Part) > 0 && ep.Media[0].Part[0].File != "" {
+			return path.Base(ep.Media[0].Part[0].File)
+		}
+	}
+	return ""
+}
+
+// findFileByBasename does an exact (case-insensitive) filename match across
+// everything decypharr tracks. Used when Plex itself has already told us
+// the exact next-episode filename - a plain string comparison, no title
+// parsing or normalization involved, so it can't suffer the class of
+// mismatch bugs that title-based matching (findNextEpisode) can.
+func findFileByBasename(mgr *manager.Manager, basename string) *manager.FileInfo {
+	if basename == "" {
+		return nil
+	}
+	wantLower := strings.ToLower(basename)
+	_, torrents := mgr.GetEntryChildren(manager.EntryAllFolder)
+	for _, entry := range torrents {
+		if !entry.IsDir() {
+			continue
+		}
+		_, children := mgr.GetTorrentChildren(entry.Name())
+		for i := range children {
+			child := &children[i]
+			if child.IsDir() {
+				continue
+			}
+			if strings.ToLower(child.Name()) == wantLower {
+				return child
+			}
+		}
+	}
+	return nil
 }
 
 // startPlexPrewarmPoller runs until ctx is cancelled. No-op unless both
@@ -115,13 +201,30 @@ func pollPlexSessionsOnce(ctx context.Context, client *http.Client, plexURL, ple
 			log.Info().Str("show", s.GrandparentTitle).Int("season", s.ParentIndex).Int("episode", s.Index).
 				Msg("Prewarm: Plex session crossed threshold, looking for next episode")
 
-			current := utils.ParsedName{
-				Title:   s.GrandparentTitle,
-				Season:  s.ParentIndex,
-				EpStart: s.Index,
-				IsTV:    true,
+			// Primary path: ask Plex directly for the next episode's exact
+			// filename and match it verbatim - Plex resolves "next episode"
+			// from its own metadata, no title parsing/normalization involved,
+			// so it can't suffer the class of mismatch bug title matching can
+			// (already hit twice tonight: a season-pack folder name PTT
+			// couldn't parse, and a "(US)"-style disambiguator Plex keeps but
+			// release filenames drop).
+			var next *manager.FileInfo
+			if nextName := fetchNextEpisodeFilename(ctx, client, plexURL, plexToken, s.ParentRatingKey, s.Index+1); nextName != "" {
+				next = findFileByBasename(mgr, nextName)
 			}
-			next := findNextEpisode(mgr, current)
+			// Fallback: title/season/episode-number matching, for when the
+			// direct Plex lookup fails (network hiccup, season boundary
+			// Plex's /children call doesn't cover, etc.) rather than giving
+			// up entirely.
+			if next == nil {
+				current := utils.ParsedName{
+					Title:   s.GrandparentTitle,
+					Season:  s.ParentIndex,
+					EpStart: s.Index,
+					IsTV:    true,
+				}
+				next = findNextEpisode(mgr, current)
+			}
 			if next == nil {
 				log.Info().Str("show", s.GrandparentTitle).Int("season", s.ParentIndex).Int("episode", s.Index+1).
 					Msg("Prewarm: no matching next episode found among active torrents/jobs")
@@ -316,6 +419,17 @@ func prewarmFile(vfsMgr *vfs.Manager, info *manager.FileInfo, log zerolog.Logger
 // normalizeEpisodeTitle makes two title strings comparable regardless of
 // spacing/punctuation/case differences between release names.
 func normalizeEpisodeTitle(s string) string {
+	// Strip a trailing parenthetical disambiguator ("The Office (US)" ->
+	// "The Office") before reducing to bare alphanumerics. Plex's
+	// grandparentTitle keeps these (it uses them to distinguish shows with
+	// the same name, e.g. US vs UK versions), but ParseTorrentName drops
+	// them from release filenames - without stripping here, a session's
+	// title ("The Office (US)" -> "theofficeus") would never match its own
+	// tracked files' title ("The Office" -> "theoffice"), silently failing
+	// every match for any show whose Plex title carries this kind of suffix.
+	if i := strings.IndexByte(s, '('); i >= 0 {
+		s = s[:i]
+	}
 	s = strings.ToLower(s)
 	var b strings.Builder
 	for _, r := range s {
