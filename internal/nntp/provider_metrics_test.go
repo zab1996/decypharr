@@ -432,6 +432,75 @@ func bodyTestConnection(t *testing.T, payload []byte, usage *atomic.Int64) *Conn
 	return conn
 }
 
+func missingBodyTestConnection(t *testing.T) *Connection {
+	t.Helper()
+	clientSide, serverSide := net.Pipe()
+	reader := bufio.NewReader(clientSide)
+	conn := &Connection{
+		conn: clientSide, reader: reader, text: textproto.NewReader(reader),
+		writer: bufio.NewWriter(clientSide), logger: zerolog.Nop(),
+	}
+	t.Cleanup(func() {
+		_ = clientSide.Close()
+		_ = serverSide.Close()
+	})
+	go func() {
+		defer serverSide.Close()
+		commandReader := bufio.NewReader(serverSide)
+		_, _ = commandReader.ReadString('\n')
+		_, _ = io.WriteString(serverSide, "430 no such article\r\n")
+	}()
+	return conn
+}
+
+func TestMeasureProviderSpeedRequiresBodyAndFallsBackToAnotherCandidate(t *testing.T) {
+	provider := config.UsenetProvider{Host: "news.example.com", Port: 563, SSL: true}
+	payload := bytes.Repeat([]byte("speed-test-body"), 64)
+	var usage atomic.Int64
+	var opens atomic.Int32
+	opener := func(context.Context, config.UsenetProvider) (*Connection, error) {
+		if opens.Add(1) == 1 {
+			return missingBodyTestConnection(t), nil
+		}
+		return bodyTestConnection(t, payload, &usage), nil
+	}
+	result := measureProviderSpeed(
+		context.Background(), provider, []string{"missing", "available"}, time.Now(), 51, opener,
+	)
+	if result.Error != "" || result.SpeedMBps <= 0 || result.BytesRead <= 0 || result.LatencyMs != 51 {
+		t.Fatalf("unexpected speed result: %+v", result)
+	}
+	if opens.Load() != 2 {
+		t.Fatalf("connection attempts = %d, want 2", opens.Load())
+	}
+
+	withoutBody := measureProviderSpeed(context.Background(), provider, nil, time.Now(), 51, opener)
+	if withoutBody.Error == "" || withoutBody.SpeedMBps != 0 {
+		t.Fatalf("latency-only test incorrectly succeeded: %+v", withoutBody)
+	}
+}
+
+func TestScheduledHealthRefreshAlsoStoresSpeed(t *testing.T) {
+	provider := config.UsenetProvider{Host: "news.example.com", Port: 563, SSL: true}
+	client := &Client{speedTestResults: xsync.NewMap[string, SpeedTestResult]()}
+	m := newProviderMonitor(client, []config.UsenetProvider{provider}, nil)
+	m.testSegments = func() []string { return []string{"available"} }
+	var usage atomic.Int64
+	var opens atomic.Int32
+	m.openConnection = func(context.Context, config.UsenetProvider) (*Connection, error) {
+		if opens.Add(1) == 1 {
+			return dateTestConnection(t, 111), nil
+		}
+		return bodyTestConnection(t, bytes.Repeat([]byte("scheduled-speed"), 64), &usage), nil
+	}
+
+	health := m.performHealthCheck(context.Background(), provider)
+	result, ok := client.GetSpeedTestResult(provider.Host)
+	if health.Status != "healthy" || !ok || result.SpeedMBps <= 0 || result.LatencyMs < 0 {
+		t.Fatalf("health=%+v speed=%+v present=%v", health, result, ok)
+	}
+}
+
 type failAfterWriter struct {
 	remaining int
 }

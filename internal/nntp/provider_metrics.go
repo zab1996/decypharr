@@ -73,6 +73,7 @@ type providerMonitor struct {
 	flushInterval  time.Duration
 	checkProvider  func(context.Context, config.UsenetProvider) ProviderHealth
 	openConnection func(context.Context, config.UsenetProvider) (*Connection, error)
+	testSegments   func() []string
 
 	ctx          context.Context
 	cancel       context.CancelFunc
@@ -301,15 +302,30 @@ func (m *providerMonitor) performHealthCheck(ctx context.Context, provider confi
 	if err := conn.ping(); err != nil {
 		message := sanitizeProviderError(err, provider)
 		if strings.Contains(strings.ToLower(message), "unexpected date response") {
-			return ProviderHealth{
+			health := ProviderHealth{
 				Status: "healthy", CheckedAt: checkedAtText,
 				Detail: "Authenticated successfully; DATE is not supported by this server",
 			}
+			m.refreshProviderSpeed(ctx, provider, checkedAt, 0)
+			return health
 		}
 		return ProviderHealth{Status: "unknown", CheckedAt: checkedAtText, Error: message}
 	}
 	latency := time.Since(pingStarted).Milliseconds()
+	m.refreshProviderSpeed(ctx, provider, checkedAt, latency)
 	return ProviderHealth{Status: "healthy", CheckedAt: checkedAtText, LatencyMs: &latency}
+}
+
+func (m *providerMonitor) refreshProviderSpeed(ctx context.Context, provider config.UsenetProvider, checkedAt time.Time, latencyMs int64) {
+	if m.client == nil || m.testSegments == nil || m.openConnection == nil {
+		return
+	}
+	result := measureProviderSpeed(ctx, provider, m.testSegments(), checkedAt, latencyMs, m.openConnection)
+	if result.Error != "" || result.SpeedMBps <= 0 {
+		return
+	}
+	m.client.speedTestResults.Store(provider.Host, result)
+	m.setSpeedTest(provider, result)
 }
 
 func sanitizeProviderError(err error, provider config.UsenetProvider) string {

@@ -2,6 +2,7 @@ package usenet
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -34,6 +35,8 @@ var streamBufferPool = sync.Pool{
 		return make([]byte, bufferSize)
 	},
 }
+
+var errSpeedTestCandidatesFound = errors.New("enough speed test candidates found")
 
 func acquireStreamBuffer() []byte {
 	buf := streamBufferPool.Get().([]byte)
@@ -255,6 +258,7 @@ func New(metricStores ...*hybrid.Store) (*Usenet, error) {
 		fs:                       xsync.NewMap[string, *fsEntry](),
 		failedFiles:              xsync.NewMap[string, error](),
 	}
+	client.StartProviderMonitor(u.findTestSegments)
 
 	// clean streams dir
 	u.initStreamsDir(cfg.Usenet.DiskBufferPath)
@@ -1003,30 +1007,35 @@ func (u *Usenet) NZBStorage() *NZBStorage {
 // SpeedTest runs a speed test for a specific NNTP provider
 // It finds a segment from a processed NZB to download for real speed measurement
 func (u *Usenet) SpeedTest(ctx context.Context, providerHost string) nntp.SpeedTestResult {
-	// Try to find a segment from any processed NZB for the speed test
-	messageID := u.findTestSegment()
-	return u.nntp.SpeedTest(ctx, providerHost, messageID)
+	return u.nntp.SpeedTest(ctx, providerHost, u.findTestSegments())
 }
 
-// findTestSegment looks for a segment from any processed NZB to use for speed testing
-func (u *Usenet) findTestSegment() string {
-	var messageID string
-
-	// Iterate through NZBs to find a usable segment
+// findTestSegments returns several likely BODY candidates so a missing article
+// on one provider does not turn a manual speed test into a latency-only result.
+func (u *Usenet) findTestSegments() []string {
+	const maxCandidates = 32
+	candidates := make([]string, 0, maxCandidates)
 	_ = u.nzbStorage.ForEachNZB(func(nzb *storage.NZB) error {
 		for _, file := range nzb.Files {
 			if file.IsDeleted || len(file.Segments) == 0 {
 				continue
 			}
-			// Use the first segment we find
-			messageID = file.Segments[0].MessageID
-			// Return an error to stop iteration (not a real error)
-			return fmt.Errorf("found")
+			largest := file.Segments[0]
+			for _, segment := range file.Segments[1:] {
+				if segment.Bytes > largest.Bytes {
+					largest = segment
+				}
+			}
+			if largest.MessageID != "" {
+				candidates = append(candidates, largest.MessageID)
+			}
+			if len(candidates) >= maxCandidates {
+				return errSpeedTestCandidatesFound
+			}
 		}
 		return nil
 	})
-
-	return messageID
+	return candidates
 }
 
 // GetSpeedTestResults returns all stored speed test results

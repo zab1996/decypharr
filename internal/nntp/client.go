@@ -228,11 +228,20 @@ func NewClient(cfg *config.Config, metricStores ...*hybrid.Store) (*Client, erro
 		metricStore = metricStores[0]
 	}
 	cm.providerMonitor = newProviderMonitor(cm, providers, metricStore)
-	cm.providerMonitor.Start()
 
 	// Start background reaper
 	go cm.reaper()
 	return cm, nil
+}
+
+// StartProviderMonitor starts startup/hourly checks after the Usenet metadata
+// store is ready to supply BODY candidates for throughput measurements.
+func (c *Client) StartProviderMonitor(testSegments func() []string) {
+	if c.providerMonitor == nil {
+		return
+	}
+	c.providerMonitor.testSegments = testSegments
+	c.providerMonitor.Start()
 }
 
 // put returns a connection to the pool and releases the slot.
@@ -1391,7 +1400,7 @@ func (c *Client) Close() error {
 }
 
 // SpeedTest runs a speed test for a specific provider.
-func (c *Client) SpeedTest(ctx context.Context, providerHost string, messageID string) SpeedTestResult {
+func (c *Client) SpeedTest(ctx context.Context, providerHost string, messageIDs []string) SpeedTestResult {
 	result := SpeedTestResult{
 		Provider: providerHost,
 		TestedAt: utils.Now(),
@@ -1412,13 +1421,16 @@ func (c *Client) SpeedTest(ctx context.Context, providerHost string, messageID s
 		return result
 	}
 	defer func() {
-		c.speedTestResults.Store(providerHost, result)
-		if c.providerMonitor != nil {
+		if result.Error == "" && result.SpeedMBps > 0 {
+			c.speedTestResults.Store(providerHost, result)
+		}
+		if c.providerMonitor != nil && result.Error == "" && result.SpeedMBps > 0 {
 			c.providerMonitor.setSpeedTest(*targetProvider, result)
 		}
 	}()
 
 	// Create connection
+	connectionStarted := time.Now()
 	conn, err := c.createConnection(ctx, *targetProvider)
 	if err != nil {
 		result.Error = fmt.Sprintf("connection failed: %v", err)
@@ -1430,6 +1442,7 @@ func (c *Client) SpeedTest(ctx context.Context, providerHost string, messageID s
 		}
 		return result
 	}
+	connectionLatency := time.Since(connectionStarted).Milliseconds()
 	defer func(conn *Connection) {
 		_ = conn.Close()
 	}(conn)
@@ -1437,50 +1450,90 @@ func (c *Client) SpeedTest(ctx context.Context, providerHost string, messageID s
 	// Measure latency using ping (true network RTT)
 	pingStart := utils.Now()
 	if err := conn.ping(); err != nil {
-		result.Error = fmt.Sprintf("ping failed: %v", err)
-		if c.providerMonitor != nil {
-			message := sanitizeProviderError(err, *targetProvider)
-			health := ProviderHealth{Status: "unknown", CheckedAt: result.TestedAt.Format(time.RFC3339), Error: message}
-			if strings.Contains(strings.ToLower(message), "unexpected date response") {
-				health = ProviderHealth{
+		message := sanitizeProviderError(err, *targetProvider)
+		if strings.Contains(strings.ToLower(message), "unexpected date response") {
+			// DATE is optional on some otherwise usable providers. Use the full
+			// connection/TLS/authentication time as the latency measurement and
+			// continue to the BODY throughput test.
+			result.LatencyMs = connectionLatency
+			if c.providerMonitor != nil {
+				c.providerMonitor.setHealth(canonicalProviderKey(*targetProvider), ProviderHealth{
 					Status: "healthy", CheckedAt: result.TestedAt.Format(time.RFC3339),
 					Detail: "Authenticated successfully; DATE is not supported by this server",
-				}
+				})
 			}
-			c.providerMonitor.setHealth(canonicalProviderKey(*targetProvider), health)
+		} else {
+			result.Error = fmt.Sprintf("ping failed: %v", err)
+			if c.providerMonitor != nil {
+				c.providerMonitor.setHealth(canonicalProviderKey(*targetProvider), ProviderHealth{
+					Status: "unknown", CheckedAt: result.TestedAt.Format(time.RFC3339), Error: message,
+				})
+			}
+			return result
 		}
+	} else {
+		result.LatencyMs = time.Since(pingStart).Milliseconds()
+		if c.providerMonitor != nil {
+			latency := result.LatencyMs
+			c.providerMonitor.setHealth(canonicalProviderKey(*targetProvider), ProviderHealth{
+				Status: "healthy", CheckedAt: result.TestedAt.Format(time.RFC3339), LatencyMs: &latency,
+			})
+		}
+	}
+
+	measured := measureProviderSpeed(ctx, *targetProvider, messageIDs, result.TestedAt, result.LatencyMs, c.createConnection)
+	result.SpeedMBps = measured.SpeedMBps
+	result.BytesRead = measured.BytesRead
+	result.Error = measured.Error
+
+	return result
+}
+
+func measureProviderSpeed(
+	ctx context.Context,
+	provider config.UsenetProvider,
+	messageIDs []string,
+	testedAt time.Time,
+	latencyMs int64,
+	openConnection func(context.Context, config.UsenetProvider) (*Connection, error),
+) SpeedTestResult {
+	result := SpeedTestResult{Provider: provider.Host, TestedAt: testedAt, LatencyMs: latencyMs}
+	if len(messageIDs) == 0 {
+		result.Error = "no NZB article is available for a throughput test"
 		return result
 	}
-	result.LatencyMs = time.Since(pingStart).Milliseconds()
-	if c.providerMonitor != nil {
-		latency := result.LatencyMs
-		c.providerMonitor.setHealth(canonicalProviderKey(*targetProvider), ProviderHealth{
-			Status: "healthy", CheckedAt: result.TestedAt.Format(time.RFC3339), LatencyMs: &latency,
-		})
+
+	var lastErr error
+	for _, messageID := range messageIDs {
+		if ctx.Err() != nil {
+			lastErr = ctx.Err()
+			break
+		}
+		conn, err := openConnection(ctx, provider)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		downloadStart := time.Now()
+		data, downloadErr := conn.GetBody(messageID)
+		downloadDuration := time.Since(downloadStart)
+		_ = conn.Close()
+		if downloadErr != nil {
+			lastErr = downloadErr
+			continue
+		}
+		result.BytesRead = int64(len(data))
+		if downloadDuration > 0 && result.BytesRead > 0 {
+			result.SpeedMBps = float64(result.BytesRead) / downloadDuration.Seconds() / (1024 * 1024)
+			return result
+		}
+		lastErr = errors.New("article body was empty")
 	}
 
-	// If no messageID provided, just return latency
-	if messageID == "" {
-		return result
+	result.Error = "no usable NZB article was found for this provider"
+	if lastErr != nil {
+		result.Error += ": " + sanitizeProviderError(lastErr, provider)
 	}
-
-	// Download the segment to measure actual speed
-	downloadStart := utils.Now()
-	data, err := conn.GetBody(messageID)
-	downloadDuration := time.Since(downloadStart)
-
-	if err != nil {
-		result.Error = fmt.Sprintf("download failed: %v", err)
-		return result
-	}
-
-	result.BytesRead = int64(len(data))
-
-	// Calculate speed in MB/s
-	if downloadDuration.Seconds() > 0 {
-		result.SpeedMBps = float64(result.BytesRead) / downloadDuration.Seconds() / (1024 * 1024)
-	}
-
 	return result
 }
 

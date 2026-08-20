@@ -1257,7 +1257,7 @@
 										${usageWindowEnd ? `<div class="text-xs text-base-content/50">Resets after ${usageWindowEnd}</div>` : ''}
 									</div>
 								</div>
-								<div class="text-xs text-base-content/50 mt-2">
+								<div id="health-summary-${provider.host.replace(/\./g, '-')}" class="text-xs text-base-content/50 mt-2">
 									Health checked: ${checkedAt}${latencyText}${speedTestText}
 								</div>
 								${healthMessage ? `
@@ -1423,11 +1423,21 @@
                     resultDiv.innerHTML = `<span class="text-error"><i class="bi bi-x-circle"></i> ${result.error}</span>`;
                 } else {
                     const testedAt = result.tested_at ? new Date(result.tested_at).toLocaleTimeString() : '';
+                    const speedDisplay = result.speed_mbps > 0 ? `${result.speed_mbps.toFixed(1)} MB/s` : '-';
+					const healthSummary = document.getElementById(`health-summary-${providerHost.replace(/\./g, '-')}`);
+					if (healthSummary) {
+						const checkedAt = result.tested_at ? new Date(result.tested_at).toLocaleString() : 'Just now';
+						healthSummary.textContent = `Health checked: ${checkedAt} · ${result.latency_ms || 0}ms · Last test ${speedDisplay}`;
+					}
                     resultDiv.innerHTML = `
                         <div class="flex items-center gap-2">
                             <i class="bi bi-check-circle text-success"></i>
                             <span><strong>${result.latency_ms || 0}ms</strong> latency</span>
                         </div>
+						<div class="flex items-center gap-2 text-success">
+							<i class="bi bi-speedometer2"></i>
+							<span><strong>${speedDisplay}</strong></span>
+						</div>
                         <div class="text-xs text-base-content/50 mt-1">Tested: ${testedAt}</div>
                     `;
                 }
