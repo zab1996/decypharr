@@ -31,9 +31,16 @@ const (
 	plexPollInterval  = 20 * time.Second
 	plexPrewarmThresh = 0.70
 
-	prewarmFraction         = 0.20
-	prewarmMaxBytes         = 256 * 1024 * 1024
-	prewarmTimeout          = 30 * time.Second
+	prewarmFraction = 0.20
+	prewarmMaxBytes = 256 * 1024 * 1024
+
+	// prewarmTimeout bounds a single prewarm fetch. Observed repeatedly in
+	// live testing: a real NZB download at ~4.75MB/s needs ~45s to pull a
+	// full 256MB fetch, so 30s consistently cut it off with ~30% still
+	// unfetched. 60s gives realistic download speeds enough room to finish
+	// the full fraction instead of routinely landing partial.
+	prewarmTimeout = 60 * time.Second
+
 	minPlausibleEpisodeSize = 20 * 1024 * 1024
 
 	// prewarmedTTL bounds how long a session key is remembered as "already
