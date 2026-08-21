@@ -28,5 +28,5 @@ jobs:
           push: true
           tags: ghcr.io/zab1996/cli_mount:prewarm-next-episode
           build-args: |
-            VERSION=2.4.7
+            VERSION=2.4.8
             CHANNEL=prewarm-next-episode
