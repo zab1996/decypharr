@@ -44,12 +44,16 @@ func (s *Server) handleAddContent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	arrName := r.FormValue("arr")
+	cfg := config.Get()
 	action := r.FormValue("action")
+	if action == "" {
+		action = string(cfg.DefaultDownloadAction)
+	}
 	debridName := r.FormValue("debrid")
 	callbackUrl := r.FormValue("callbackUrl")
 	downloadFolder := r.FormValue("downloadFolder")
 	if downloadFolder == "" {
-		downloadFolder = config.Get().DownloadFolder
+		downloadFolder = cfg.DownloadFolder
 	}
 	skipMultiSeason := r.FormValue("skipMultiSeason") == "true"
 
@@ -61,7 +65,6 @@ func (s *Server) handleAddContent(w http.ResponseWriter, r *http.Request) {
 	rmTrackerUrls := r.FormValue("rmTrackerUrls") == "true"
 
 	// Check config setting - if always remove tracker URLs is enabled, force it to true
-	cfg := config.Get()
 	if cfg.AlwaysRmTrackerUrls {
 		rmTrackerUrls = true
 	}
