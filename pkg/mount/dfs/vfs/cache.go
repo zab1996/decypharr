@@ -347,36 +347,50 @@ func (c *Cache) evictCandidates(now time.Time, candidates []candidateEntry, tota
 
 	removed := make(map[string]struct{})
 	removalErrors := 0
-	removeCandidate := func(candidate candidateEntry) {
+	// removeCandidate returns whether removal fully succeeded. Callers must
+	// only deduct cachedSize from totalSize on success — a failed os.Remove
+	// (permissions, file busy, etc.) means the bytes are still on disk, and
+	// deducting anyway makes the cache believe it freed space it didn't,
+	// letting it silently under-evict over time. Mirrors purgeCandidates'
+	// hadError-gated accounting below.
+	removeCandidate := func(candidate candidateEntry) bool {
 		if _, skip := removed[candidate.key]; skip {
-			return
+			return true
 		}
 		// Never remove items that are in the map or have open handles
 		if candidate.inMap || candidate.opens > 0 {
-			return
+			return false
 		}
+		hadError := false
 		// Remove only the specific data + meta files, not the entire entry directory
 		if candidate.dataPath != "" {
 			if err := os.Remove(candidate.dataPath); err != nil && !os.IsNotExist(err) {
 				c.logger.Warn().Err(err).Str("path", candidate.dataPath).Msg("failed to remove cache data file")
 				removalErrors++
+				hadError = true
 			}
 		}
 		if candidate.metaPath != "" {
 			if err := os.Remove(candidate.metaPath); err != nil && !os.IsNotExist(err) {
 				c.logger.Warn().Err(err).Str("path", candidate.metaPath).Msg("failed to remove cache meta file")
 				removalErrors++
+				hadError = true
 			}
 		}
+		if hadError {
+			return false
+		}
 		removed[candidate.key] = struct{}{}
+		return true
 	}
 
 	// Phase 1: Remove expired entries (only if not in map)
 	if c.config.CacheExpiry > 0 {
 		for _, candidate := range candidates {
 			if !candidate.inMap && candidate.opens == 0 && now.Sub(candidate.atime) > c.config.CacheExpiry {
-				removeCandidate(candidate)
-				totalSize -= candidate.cachedSize
+				if removeCandidate(candidate) {
+					totalSize -= candidate.cachedSize
+				}
 			}
 		}
 	}
@@ -401,11 +415,15 @@ func (c *Cache) evictCandidates(now time.Time, candidates []candidateEntry, tota
 			if _, skip := removed[candidate.key]; skip {
 				continue
 			}
-			removeCandidate(candidate)
-			totalSize -= candidate.cachedSize
+			if removeCandidate(candidate) {
+				totalSize -= candidate.cachedSize
+			}
 		}
 	}
 
+	if totalSize < 0 {
+		totalSize = 0
+	}
 	return totalSize, len(removed), removalErrors, removed
 }
 

@@ -144,6 +144,63 @@ func TestEvictCandidates_RemovesOnlyTargetPair(t *testing.T) {
 	}
 }
 
+// A candidate whose data file can't actually be removed (e.g. a permissions
+// or busy-file error) must not be counted as freed space, or the cache
+// believes it evicted bytes it didn't and can silently under-evict over time.
+func TestEvictCandidates_FailedRemoveDoesNotDeductSize(t *testing.T) {
+	cacheDir := t.TempDir()
+	entryDir := filepath.Join(cacheDir, "entry")
+	if err := os.MkdirAll(entryDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// os.Remove refuses to remove a non-empty directory, giving a
+	// deterministic, cross-platform way to force a removal failure.
+	targetData := filepath.Join(entryDir, "a.mkv")
+	if err := os.MkdirAll(targetData, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(targetData, "child"), []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	targetMeta := targetData + ".json"
+	if err := os.WriteFile(targetMeta, []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	c := newTestCache(cacheDir)
+	now := time.Now()
+	candidates := []candidateEntry{
+		{
+			key:        "entry/a.mkv",
+			path:       entryDir,
+			dataPath:   targetData,
+			metaPath:   targetMeta,
+			atime:      now.Add(-2 * time.Hour),
+			mtime:      now.Add(-2 * time.Hour),
+			cachedSize: 500,
+		},
+	}
+
+	totalSize, removed, removalErrors, removedKeys := c.evictCandidates(now, candidates, 500, 0)
+	if removalErrors != 1 {
+		t.Fatalf("expected 1 removal error, got %d", removalErrors)
+	}
+	if removed != 0 {
+		t.Fatalf("expected 0 candidates counted as removed, got %d", removed)
+	}
+	if totalSize != 500 {
+		t.Fatalf("expected totalSize unchanged at 500 after a failed removal, got %d", totalSize)
+	}
+	if _, ok := removedKeys["entry/a.mkv"]; ok {
+		t.Fatalf("candidate with a failed removal must not be tracked as removed, got %#v", removedKeys)
+	}
+
+	if _, err := os.Stat(targetData); err != nil {
+		t.Fatalf("target data directory should still exist after a failed remove, stat err=%v", err)
+	}
+}
+
 func TestGetStatsReportsDiskItemsSeparatelyFromActiveItems(t *testing.T) {
 	cacheDir := t.TempDir()
 	entryDir := filepath.Join(cacheDir, "entry")
