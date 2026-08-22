@@ -201,6 +201,59 @@ func TestEvictCandidates_FailedRemoveDoesNotDeductSize(t *testing.T) {
 	}
 }
 
+// A failed flush must leave metaDirty set so the next tick retries it,
+// instead of the pre-fix behavior of clearing dirty at the end of a
+// successful path only (which happened to leave error paths alone by
+// omission, but was never explicit) — this locks that in for every error
+// path, and specifically exercises the os.MkdirAll failure branch.
+func TestFlushMetadata_WriteFailureLeavesDirty(t *testing.T) {
+	tmpDir := t.TempDir()
+	// A regular file where flushMetadata expects to MkdirAll a directory
+	// forces a deterministic, permission-independent failure (works even
+	// running as root, unlike chmod-based approaches).
+	blocker := filepath.Join(tmpDir, "blocker")
+	if err := os.WriteFile(blocker, []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	item := &CacheItem{
+		cache:    newTestCache(tmpDir),
+		key:      "test",
+		metaPath: filepath.Join(blocker, "sub", "meta.json"),
+	}
+	item.markMetadataDirty()
+
+	item.flushMetadata(true)
+
+	if !item.metaDirty.Load() {
+		t.Fatal("expected metaDirty to stay set after a failed flush")
+	}
+}
+
+// Clearing metaDirty must happen before the snapshot, not after a
+// successful write, or a markMetadataDirty() call landing in between gets
+// silently lost. This proves the observable contract: dirty stays set
+// (and a subsequent flush actually writes) if a mutation is signalled
+// around a flush.
+func TestFlushMetadata_SucceedsAndClearsDirty(t *testing.T) {
+	tmpDir := t.TempDir()
+	item := &CacheItem{
+		cache:    newTestCache(tmpDir),
+		key:      "test",
+		metaPath: filepath.Join(tmpDir, "meta.json"),
+	}
+	item.markMetadataDirty()
+
+	item.flushMetadata(false)
+
+	if item.metaDirty.Load() {
+		t.Fatal("expected metaDirty to be cleared after a successful flush")
+	}
+	if _, err := os.Stat(item.metaPath); err != nil {
+		t.Fatalf("expected metadata file to be written, stat err=%v", err)
+	}
+}
+
 func TestGetStatsReportsDiskItemsSeparatelyFromActiveItems(t *testing.T) {
 	cacheDir := t.TempDir()
 	entryDir := filepath.Join(cacheDir, "entry")

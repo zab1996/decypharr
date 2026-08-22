@@ -1055,6 +1055,14 @@ func (item *CacheItem) flushMetadata(force bool) {
 	if !force && !item.metaDirty.Load() {
 		return
 	}
+	// Clear dirty BEFORE snapshotting item.info, not after the write
+	// succeeds. A markMetadataDirty() call landing between the snapshot and
+	// a trailing Store(false) would otherwise be silently erased — that
+	// mutation is already reflected in nothing on disk, but the flag says
+	// clean, so it may never get flushed. Clearing first means any such
+	// call re-arms dirty and gets picked up by the next tick instead.
+	item.metaDirty.Store(false)
+
 	item.metaMu.RLock()
 	info := item.info
 	if len(info.Rs) > 0 {
@@ -1067,11 +1075,13 @@ func (item *CacheItem) flushMetadata(force bool) {
 	data, err := json.Marshal(info)
 	if err != nil {
 		item.cache.logger.Warn().Err(err).Str("key", item.key).Msg("failed to marshal cache metadata")
+		item.metaDirty.Store(true)
 		return
 	}
 	// Confirm directory exists before writing metadata (in case it was deleted by cleanup)
 	if err := os.MkdirAll(filepath.Dir(item.metaPath), 0755); err != nil {
 		item.cache.logger.Warn().Err(err).Str("key", item.key).Msg("failed to create cache directory for metadata")
+		item.metaDirty.Store(true)
 		return
 	}
 	// Atomic write: write to temp file then rename to avoid corrupt reads
@@ -1079,14 +1089,15 @@ func (item *CacheItem) flushMetadata(force bool) {
 	tmpPath := item.metaPath + ".tmp"
 	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
 		item.cache.logger.Warn().Err(err).Str("key", item.key).Msg("failed to write cache metadata")
+		item.metaDirty.Store(true)
 		return
 	}
 	if err := os.Rename(tmpPath, item.metaPath); err != nil {
 		item.cache.logger.Warn().Err(err).Str("key", item.key).Msg("failed to rename cache metadata")
 		_ = os.Remove(tmpPath)
+		item.metaDirty.Store(true)
 		return
 	}
-	item.metaDirty.Store(false)
 }
 
 // ItemInfo is persisted to disk
