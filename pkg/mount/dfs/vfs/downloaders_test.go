@@ -221,6 +221,38 @@ func TestCacheItemReleaseStopsDownloadersOnZeroOpens(t *testing.T) {
 	}
 }
 
+// isCircuitOpen's cooldown-expiry path used to reset circuitOpen/circuitOpenAt
+// inline without going through resetCircuitLocked, leaking the cache-wide
+// circuitBreakers gauge by one every time a breaker expired via a read
+// hitting this path (as opposed to going idle first). This proves the gauge
+// comes back down.
+func TestIsCircuitOpen_CooldownExpiryDecrementsGauge(t *testing.T) {
+	cache := &Cache{}
+	item := &CacheItem{cache: cache}
+	dls := &Downloaders{item: item}
+
+	dls.mu.Lock()
+	dls.openCircuitLocked()
+	dls.mu.Unlock()
+
+	if got := cache.circuitBreakers.Load(); got != 1 {
+		t.Fatalf("expected circuitBreakers gauge = 1 after opening, got %d", got)
+	}
+
+	// Back-date circuitOpenAt so the cooldown reads as already expired.
+	dls.circuitOpenAt.Store(time.Now().Add(-circuitCooldownDuration - time.Second).UnixNano())
+
+	if dls.isCircuitOpen() {
+		t.Fatal("expected isCircuitOpen to report false once cooldown has expired")
+	}
+	if dls.circuitOpen.Load() {
+		t.Fatal("expected circuitOpen to be cleared after cooldown expiry")
+	}
+	if got := cache.circuitBreakers.Load(); got != 0 {
+		t.Fatalf("expected circuitBreakers gauge decremented back to 0, got %d", got)
+	}
+}
+
 func TestNoProgressWatchdogCancelsStalledAttempt(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

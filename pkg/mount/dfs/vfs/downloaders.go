@@ -745,10 +745,18 @@ func (dls *Downloaders) isCircuitOpen() bool {
 		dls.mu.Lock()
 		openedAt = dls.circuitOpenAt.Load()
 		if openedAt != 0 && time.Now().UnixNano()-openedAt >= int64(circuitCooldownDuration) {
-			dls.circuitOpen.Store(false)
-			dls.circuitOpenAt.Store(0)
+			// Errors from before the cooldown must not carry over — that
+			// would immediately re-trip the breaker on the next error
+			// instead of giving the connection a clean slate. Matches the
+			// same errorCount/lastErr + resetCircuitLocked reset used by
+			// checkIdleTimeout and StopAll. resetCircuitLocked also
+			// decrements the cache-wide circuitBreakers gauge; the inline
+			// Store(false) here previously skipped that, leaking the gauge
+			// by one every time a breaker expired via this path instead of
+			// going idle first.
 			dls.errorCount = 0
 			dls.lastErr = nil
+			dls.resetCircuitLocked()
 		}
 		dls.mu.Unlock()
 		return false
