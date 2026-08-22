@@ -57,6 +57,9 @@
                 <li><a href="{{.URLBase}}repair" class="{{if eq .Page " repair"}}menu-active{{end}}">
                     <i class="bi bi-wrench-adjustable text-accent"></i>Repair
                     </a></li>
+                <li><a href="{{.URLBase}}plex" class="{{if eq .Page " plex"}}menu-active{{end}}">
+                    <i class="bi bi-play-circle text-primary"></i>Plex
+                    </a></li>
                 <li><a href="{{.URLBase}}settings" class="{{if eq .Page " config"}}menu-active{{end}}">
                     <i class="bi bi-gear text-info"></i>Settings
                     </a></li>
@@ -92,6 +95,11 @@
                 data-tip="Repair Media">
                 <i class="bi bi-wrench-adjustable"></i>
                 <span class="hidden xl:inline">Repair</span>
+                </a></li>
+            <li><a href="{{.URLBase}}plex" class="{{if eq .Page " plex"}}menu-active{{end}} tooltip tooltip-bottom"
+                data-tip="Plex">
+                <i class="bi bi-play-circle"></i>
+                <span class="hidden xl:inline">Plex</span>
                 </a></li>
             <li><a href="{{.URLBase}}settings" class="{{if eq .Page " config"}}menu-active{{end}} tooltip
                 tooltip-bottom" data-tip="Settings">
@@ -141,6 +149,8 @@
     {{ template "download" . }}
     {{ else if eq .Page "repair" }}
     {{ template "repair" . }}
+    {{ else if eq .Page "plex" }}
+    {{ template "plex" . }}
     {{ else if eq .Page "stats" }}
     {{ template "stats" . }}
     {{ else if eq .Page "config" }}

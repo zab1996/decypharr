@@ -13,7 +13,7 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-var storeNames = []string{"entries", "queue", "items", "repair_state", "repair_runs"}
+var storeNames = []string{"entries", "queue", "items", "repair_state", "repair_runs", "provider_metrics"}
 
 // legacyStoreNames are buckets from the v1 repair system. They are removed
 // on startup so they don't accumulate dead data.
@@ -21,21 +21,19 @@ var legacyStoreNames = []string{"repair_jobs", "repair_keys"}
 
 // Storage handles persistence using HybridStore
 type Storage struct {
-	entries     *hybrid.Store
-	queue       *hybrid.Store
-	entryItems  *hybrid.Store
-	repairState *hybrid.Store
-	repairRuns  *hybrid.Store
-	dir         string
-	logger      zerolog.Logger
+	entries         *hybrid.Store
+	queue           *hybrid.Store
+	entryItems      *hybrid.Store
+	repairState     *hybrid.Store
+	repairRuns      *hybrid.Store
+	providerMetrics *hybrid.Store
+	dir             string
+	logger          zerolog.Logger
 
 	healthCountsMu      sync.Mutex
 	healthCounts        map[HealthStatus]int
 	healthCountsBuiltAt time.Time
 }
-
-
-
 
 func createItemStores(baseDir string, baseConfig hybrid.Config) (map[string]*hybrid.Store, error) {
 	items := make(map[string]*hybrid.Store)
@@ -90,13 +88,14 @@ func NewStorage(dbPath string) (*Storage, error) {
 	}
 
 	s := &Storage{
-		entries:     itemStores["entries"],
-		queue:       itemStores["queue"],
-		entryItems:  itemStores["items"],
-		repairState: itemStores["repair_state"],
-		repairRuns:  itemStores["repair_runs"],
-		dir:         dbPath,
-		logger:      log,
+		entries:         itemStores["entries"],
+		queue:           itemStores["queue"],
+		entryItems:      itemStores["items"],
+		repairState:     itemStores["repair_state"],
+		repairRuns:      itemStores["repair_runs"],
+		providerMetrics: itemStores["provider_metrics"],
+		dir:             dbPath,
+		logger:          log,
 	}
 
 	if count, err := s.MigrateMetadata(); err != nil {
@@ -110,7 +109,7 @@ func NewStorage(dbPath string) (*Storage, error) {
 
 func (s *Storage) Close() error {
 	var errs []error
-	stores := []*hybrid.Store{s.entries, s.queue, s.entryItems, s.repairState, s.repairRuns}
+	stores := []*hybrid.Store{s.entries, s.queue, s.entryItems, s.repairState, s.repairRuns, s.providerMetrics}
 	for _, store := range stores {
 		if store == nil {
 			continue
@@ -128,12 +127,19 @@ func (s *Storage) Close() error {
 // DiskSize returns the total on-disk size of all stores (O(1), no filesystem walk).
 func (s *Storage) DiskSize() int64 {
 	var size int64
-	for _, store := range []*hybrid.Store{s.entries, s.queue, s.entryItems, s.repairState, s.repairRuns} {
+	for _, store := range []*hybrid.Store{s.entries, s.queue, s.entryItems, s.repairState, s.repairRuns, s.providerMetrics} {
 		if store != nil {
 			size += store.DiskSize()
 		}
 	}
 	return size
+}
+
+// ProviderMetricsStore returns the dedicated persistent store used for NNTP
+// provider health and daily usage records. The Storage owner remains
+// responsible for closing it after the NNTP client performs its final flush.
+func (s *Storage) ProviderMetricsStore() *hybrid.Store {
+	return s.providerMetrics
 }
 
 // SaveMigrationStatus saves the system migration status

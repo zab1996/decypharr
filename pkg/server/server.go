@@ -89,6 +89,7 @@ func New(mgr *manager.Manager) *Server {
 		"templates/index.html",
 		"templates/download.html",
 		"templates/repair.html",
+		"templates/plex.html",
 		"templates/stats.html",
 		"templates/config.html",
 		"templates/browse.html",

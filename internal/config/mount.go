@@ -72,10 +72,40 @@ type DFS struct {
 
 	DaemonTimeout string `json:"daemon_timeout,omitempty"` // Time after which the FUSE daemon will exit if idle
 
+	// PrewarmNextEpisode, when true, polls Plex's /status/sessions API for
+	// real active playback and — once a session crosses ~70% of its
+	// duration — proactively fetches the first ~20% of the next episode
+	// (found across any active torrent/NZB job, not just season packs) into
+	// cache, so it starts up faster if the user continues. Requires PlexURL
+	// and PlexToken to be set - without them this is a no-op. Off by
+	// default: it's speculative bandwidth/cache usage that only pays off if
+	// the user actually continues watching.
+	//
+	// A prior version of this feature inferred "playback" from raw FUSE
+	// read offsets on the mount, with no way to reliably tell a real viewer
+	// apart from any other tool that reads files (subtitle-sync scanners,
+	// decypharr's own repair engine, media-server library scans) - it kept
+	// producing false positives no matter how the heuristic was tuned.
+	// Querying Plex directly for its own reported playback state sidesteps
+	// that whole class of problem: only genuine Plex sessions can trigger
+	// this now.
+	PrewarmNextEpisode bool `json:"prewarm_next_episode,omitempty"`
+
+	// PlexURL and PlexToken authenticate the /status/sessions poll used by
+	// PrewarmNextEpisode. Not used for anything else.
+	PlexURL   string `json:"plex_url,omitempty"`
+	PlexToken string `json:"plex_token,omitempty"`
+
+	// PrewarmMaxSize caps a single prewarm fetch, e.g. "256MB". Empty ->
+	// 256MB default. This is a flat cap regardless of the source episode's
+	// own size (a 20% fraction of a 30-70GB file would otherwise dwarf this
+	// cap anyway) - see PrewarmMaxSizeBytes.
+	PrewarmMaxSize string `json:"prewarm_max_size,omitempty"`
+
 	// File system settings
-	UID                uint32 `json:"uid,omitempty"`                 // User ID for mounted files
-	GID                uint32 `json:"gid,omitempty"`                 // Group ID for mounted files
-	Umask              string `json:"umask,omitempty"`               // File permissions mask
+	UID   uint32 `json:"uid,omitempty"`   // User ID for mounted files
+	GID   uint32 `json:"gid,omitempty"`   // Group ID for mounted files
+	Umask string `json:"umask,omitempty"` // File permissions mask
 }
 
 // DiskCacheSizeBytes resolves the DFS on-disk cache budget in bytes. Empty or
@@ -102,6 +132,20 @@ func (d DFS) BufferMemoryBytes() int64 {
 	n, err := ParseSize(d.BufferMemory)
 	if err != nil {
 		return 512 << 20
+	}
+	return n
+}
+
+// PrewarmMaxSizeBytes resolves the prewarm-next-episode fetch cap. Empty or
+// unparseable -> 256MB default.
+func (d DFS) PrewarmMaxSizeBytes() int64 {
+	const defaultBytes = 256 << 20
+	if d.PrewarmMaxSize == "" {
+		return defaultBytes
+	}
+	n, err := ParseSize(d.PrewarmMaxSize)
+	if err != nil || n <= 0 {
+		return defaultBytes
 	}
 	return n
 }

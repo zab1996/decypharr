@@ -212,12 +212,14 @@ func (c *Connection) readResponseCodeWithDeadline(timeout time.Duration) (int, [
 type Connection struct {
 	username, password, address string
 	port                        int
+	providerKey                 string
 	conn                        net.Conn
 	text                        *textproto.Reader
 	reader                      *bufio.Reader
 	writer                      *bufio.Writer
 	logger                      zerolog.Logger
 	closed                      atomic.Bool
+	recordUsage                 func(providerKey string, bytes int64)
 
 	// Body-copy idle tracking. Written by copyBodyWithIdleDeadline on
 	// copyBodyWithIdleDeadline periodically while reads make progress;
@@ -227,6 +229,12 @@ type Connection struct {
 	// and the janitor should skip it.
 	lastProgressNS atomic.Int64
 	idleNS         atomic.Int64
+}
+
+func (c *Connection) recordBodyUsage(bytes int64) {
+	if bytes > 0 && c.recordUsage != nil {
+		c.recordUsage(c.providerKey, bytes)
+	}
 }
 
 func (c *Connection) Close() error {
@@ -453,6 +461,7 @@ func (c *Connection) GetHeader(messageID string, maxSnippet int) (*YencMetadata,
 	// Read snippet to trigger header parsing and capture metadata.
 	snippet := make([]byte, maxSnippet)
 	n, err := io.ReadFull(dec, snippet)
+	c.recordBodyUsage(int64(n))
 	if err != nil && err != io.EOF && !errors.Is(err, io.ErrUnexpectedEOF) {
 		_ = c.conn.Close()
 		return nil, classifyTransferError("failed to read snippet", err)
@@ -515,9 +524,12 @@ func (c *Connection) GetHeaderPrefix(messageID string, maxSnippet int) (*YencMet
 	defer nntpyenc.ReleaseDecoder(dec)
 
 	var snippet []byte
+	var decodedBytes int64
+	defer func() { c.recordBodyUsage(decodedBytes) }()
 	if maxSnippet > 0 {
 		snippet = make([]byte, maxSnippet)
 		n, readErr := io.ReadFull(dec, snippet)
+		decodedBytes += int64(n)
 		if readErr != nil && readErr != io.EOF && !errors.Is(readErr, io.ErrUnexpectedEOF) {
 			_ = c.conn.Close()
 			return nil, classifyTransferError("failed to read snippet", readErr)
@@ -525,7 +537,9 @@ func (c *Connection) GetHeaderPrefix(messageID string, maxSnippet int) (*YencMet
 		snippet = snippet[:n]
 	}
 
-	if _, err := c.copyBodyWithIdleDeadline(io.Discard, dec, timeouts.StreamBodyTimeout); err != nil {
+	drained, err := c.copyBodyWithIdleDeadline(io.Discard, dec, timeouts.StreamBodyTimeout)
+	decodedBytes += drained
+	if err != nil {
 		_ = c.conn.Close()
 		return nil, classifyTransferError("failed to drain article body", err)
 	}
@@ -591,7 +605,8 @@ func (c *Connection) GetDecodedBodyWithMetadata(messageID string) ([]byte, *Yenc
 
 	// Pre-allocate output buffer for decoded data (~700KB typical)
 	output := bytes.NewBuffer(make([]byte, 0, 750*1024))
-	_, err = c.copyBodyWithIdleDeadline(output, dec, timeouts.StreamBodyTimeout)
+	n, err := c.copyBodyWithIdleDeadline(output, dec, timeouts.StreamBodyTimeout)
+	c.recordBodyUsage(n)
 
 	if err != nil {
 		return nil, nil, classifyTransferError("streaming yenc decode failed", err)
@@ -620,6 +635,7 @@ func (c *Connection) StreamBody(messageID string, w io.Writer) (int64, error) {
 	// Always release decoder back to pool, even on panic
 	defer nntpyenc.ReleaseDecoder(dec)
 	n, err := c.copyBodyWithIdleDeadline(w, dec, timeouts.StreamBodyTimeout)
+	c.recordBodyUsage(n)
 	if err != nil {
 		return n, classifyTransferError("streaming yenc decode failed", err)
 	}

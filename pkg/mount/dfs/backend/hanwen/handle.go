@@ -89,6 +89,7 @@ func (fh *Handle) Read(ctx context.Context, dest []byte, off int64) (fuse.ReadRe
 			return nil, syscall.EIO
 		}
 	}
+
 	return fuse.ReadResultData(dest[:n]), 0
 }
 

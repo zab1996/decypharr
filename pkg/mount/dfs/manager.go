@@ -66,6 +66,8 @@ func (m *Manager) Start(ctx context.Context) error {
 		return fmt.Errorf("backend mount failed: %w", err)
 	}
 
+	m.startPlexPrewarmPoller(ctx)
+
 	m.ready.Store(true)
 	m.logger.Info().
 		Str("mount_path", m.config.MountPath).

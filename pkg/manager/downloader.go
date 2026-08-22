@@ -123,8 +123,6 @@ func (d *Downloader) process(entry *storage.Entry, mountPath string) error {
 		return d.processStrm(entry)
 	case config.DownloadActionNone:
 		d.completeEntry(entry)
-		// Remove entry from queue
-		_ = d.manager.queue.Delete(entry.InfoHash, nil)
 		return nil
 	default:
 		return d.processSymlink(entry, mountPath)
