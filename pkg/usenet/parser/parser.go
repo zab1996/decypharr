@@ -1150,7 +1150,7 @@ func (p *NZBParser) detectFileTypeFromContent(data []byte) storage.NZBFileType {
 	// Check for Transport Stream (TS files)
 	if len(data) >= 1 && data[0] == 0x47 {
 		// Additional validation for TS files
-		if len(data) >= 188 && data[188] == 0x47 {
+		if len(data) > 188 && data[188] == 0x47 {
 			return storage.NZBFileTypeMedia
 		}
 	}

@@ -67,3 +67,30 @@ func TestGroupProcessedFiles_OverwritesFilenameWhenActualFilenamePresent(t *test
 		t.Fatal("expected content-detected filename to overwrite the subject-derived one")
 	}
 }
+
+// detectFileTypeFromContent's TS sync-byte check indexes data[188], which
+// needs at least 189 bytes. An exactly-188-byte buffer with the first sync
+// byte set must not panic, and correctly reports Unknown rather than Media
+// since there aren't enough bytes to confirm the second sync byte.
+func TestDetectFileTypeFromContent_ExactBoundaryDoesNotPanic(t *testing.T) {
+	p := &NZBParser{}
+	data := make([]byte, 188)
+	data[0] = 0x47
+
+	got := p.detectFileTypeFromContent(data)
+	if got != storage.NZBFileTypeUnknown {
+		t.Fatalf("detectFileTypeFromContent(188 bytes) = %v, want Unknown", got)
+	}
+}
+
+func TestDetectFileTypeFromContent_TrueTSPacketDetected(t *testing.T) {
+	p := &NZBParser{}
+	data := make([]byte, 189)
+	data[0] = 0x47
+	data[188] = 0x47
+
+	got := p.detectFileTypeFromContent(data)
+	if got != storage.NZBFileTypeMedia {
+		t.Fatalf("detectFileTypeFromContent(189 bytes, second sync byte present) = %v, want Media", got)
+	}
+}
