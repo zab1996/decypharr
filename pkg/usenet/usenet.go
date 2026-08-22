@@ -982,6 +982,12 @@ func (u *Usenet) GetNZB(id string) (*storage.NZB, error) {
 	return u.nzbStorage.GetNZB(id)
 }
 
+// GetNZBHeader returns NZB metadata by ID via the cheaper header-oriented
+// path (see NZBStorage.GetNZBHeader).
+func (u *Usenet) GetNZBHeader(id string) (*storage.NZB, error) {
+	return u.nzbStorage.GetNZBHeader(id)
+}
+
 // ForEachNZB iterates over all NZBs
 func (u *Usenet) ForEachNZB(fn func(*storage.NZB) error) error {
 	return u.nzbStorage.ForEachNZB(fn)
