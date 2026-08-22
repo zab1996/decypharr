@@ -21,6 +21,7 @@ import (
 	"github.com/sirrobot01/decypharr/internal/logger"
 	"github.com/sirrobot01/decypharr/internal/retry"
 	"github.com/sirrobot01/decypharr/internal/utils"
+	"github.com/sirrobot01/decypharr/pkg/storage/hybrid"
 )
 
 // ProviderPool manages connections for a single provider using a LIFO stack
@@ -44,6 +45,7 @@ type Client struct {
 	closed atomic.Bool
 	// Speed test results storage
 	speedTestResults *xsync.Map[string, SpeedTestResult]
+	providerMonitor  *providerMonitor
 
 	// repairPool is the shared worker pool that processes BatchStat
 	// chunks. Sized at construction from cfg.Repair.NNTPConnectionPercent.
@@ -211,7 +213,7 @@ func normalizeTimeouts(in TimeoutConfig) TimeoutConfig {
 }
 
 // NewClient creates a new connection manager
-func NewClient(cfg *config.Config) (*Client, error) {
+func NewClient(cfg *config.Config, metricStores ...*hybrid.Store) (*Client, error) {
 	providers := cfg.Usenet.Providers
 	if len(providers) == 0 {
 		return nil, errors.New("no NNTP providers configured")
@@ -270,10 +272,25 @@ func NewClient(cfg *config.Config) (*Client, error) {
 		}
 	}
 	cm.repairPool = cm.newRepairPool(cfg.Repair.NNTPConnectionPercent)
+	var metricStore *hybrid.Store
+	if len(metricStores) > 0 {
+		metricStore = metricStores[0]
+	}
+	cm.providerMonitor = newProviderMonitor(cm, providers, metricStore)
 
 	// Start background reaper
 	go cm.reaper()
 	return cm, nil
+}
+
+// StartProviderMonitor starts startup/hourly checks after the Usenet metadata
+// store is ready to supply BODY candidates for throughput measurements.
+func (c *Client) StartProviderMonitor(testSegments func() []string) {
+	if c.providerMonitor == nil {
+		return
+	}
+	c.providerMonitor.testSegments = testSegments
+	c.providerMonitor.Start()
 }
 
 // put returns a connection to the pool and releases the slot.
@@ -796,7 +813,6 @@ func parseSockBuf(s string) int {
 	return int(n)
 }
 
-
 // tuneTCP applies TCP_NODELAY and (re)applies the configured socket buffers
 // on the established connection. The pre-connect Control hook does the work
 // that matters for window scaling; this reinforces the sizes post-dial and
@@ -813,6 +829,28 @@ func (c *Client) tuneTCP(tcpConn *net.TCPConn) {
 }
 
 // createConnection creates a new NNTP connection to a provider
+// createPooledConnection acquires a connection through the same
+// MaxConnections-limited pool that real downloads use, instead of dialing a
+// raw connection outside the pool's slot accounting. Used by the provider
+// health/speed-check paths so they can't push a provider's simultaneous
+// connection count above its configured cap during heavy download activity
+// (which either gets the extra connection rejected by the provider - a
+// false "unhealthy" reading - or, on stricter providers, can disrupt an
+// in-flight legitimate download).
+//
+// The returned release func MUST be called exactly once - never just
+// conn.Close(), which would leak the acquired semaphore slot permanently
+// and silently shrink the pool's effective MaxConnections by one until the
+// process restarts.
+func (c *Client) createPooledConnection(ctx context.Context, provider config.UsenetProvider) (*Connection, func(), error) {
+	conn, provider, err := c.getConnectionFromProvider(ctx, provider)
+	if err != nil {
+		return nil, func() {}, err
+	}
+	release := func() { c.returnOrReleaseConn(conn, provider) }
+	return conn, release, nil
+}
+
 func (c *Client) createConnection(ctx context.Context, provider config.UsenetProvider) (*Connection, error) {
 	address := fmt.Sprintf("%s:%d", provider.Host, provider.Port)
 
@@ -862,15 +900,19 @@ func (c *Client) createConnection(ctx context.Context, provider config.UsenetPro
 	writer := bufio.NewWriterSize(netConn, 64*1024)
 
 	conn := &Connection{
-		conn:     netConn,
-		reader:   reader,
-		text:     textproto.NewReader(reader),
-		writer:   writer,
-		address:  provider.Host,
-		port:     provider.Port,
-		username: provider.Username,
-		password: provider.Password,
-		logger:   c.logger.With().Str("host", provider.Host).Logger(),
+		conn:        netConn,
+		reader:      reader,
+		text:        textproto.NewReader(reader),
+		writer:      writer,
+		address:     provider.Host,
+		port:        provider.Port,
+		username:    provider.Username,
+		password:    provider.Password,
+		logger:      c.logger.With().Str("host", provider.Host).Logger(),
+		providerKey: canonicalProviderKey(provider),
+	}
+	if c.providerMonitor != nil {
+		conn.recordUsage = c.providerMonitor.RecordUsage
 	}
 
 	// Set deadline for handshake (greeting + auth)
@@ -1032,6 +1074,13 @@ func (c *Client) Stats() map[string]interface{} {
 			"active":          active,
 			"idle":            idle,
 			"ssl":             p.SSL,
+		}
+
+		if c.providerMonitor != nil {
+			health, usage := c.providerMonitor.Stats(p)
+			providerInfo["provider_key"] = canonicalProviderKey(p)
+			providerInfo["health"] = health
+			providerInfo["usage"] = usage
 		}
 
 		// Add speed test result if available
@@ -1455,6 +1504,9 @@ func (c *Client) Close() error {
 	// connections we just force-closed, which makes them return with
 	// errors and exit cleanly.
 	c.repairPool.Stop()
+	if c.providerMonitor != nil {
+		c.providerMonitor.Close()
+	}
 
 	c.logger.Info().
 		Int("total_closed", totalClosed).
@@ -1464,7 +1516,7 @@ func (c *Client) Close() error {
 }
 
 // SpeedTest runs a speed test for a specific provider.
-func (c *Client) SpeedTest(ctx context.Context, providerHost string, messageID string) SpeedTestResult {
+func (c *Client) SpeedTest(ctx context.Context, providerHost string, messageIDs []string) SpeedTestResult {
 	result := SpeedTestResult{
 		Provider: providerHost,
 		TestedAt: utils.Now(),
@@ -1484,52 +1536,120 @@ func (c *Client) SpeedTest(ctx context.Context, providerHost string, messageID s
 		c.speedTestResults.Store(providerHost, result)
 		return result
 	}
+	defer func() {
+		if result.Error == "" && result.SpeedMBps > 0 {
+			c.speedTestResults.Store(providerHost, result)
+		}
+		if c.providerMonitor != nil && result.Error == "" && result.SpeedMBps > 0 {
+			c.providerMonitor.setSpeedTest(*targetProvider, result)
+		}
+	}()
 
-	// Create connection
-	conn, err := c.createConnection(ctx, *targetProvider)
+	// Create connection (through the same pooled/MaxConnections-limited path
+	// real downloads use, so a manual speed test can't push this provider's
+	// connection count above its configured cap during active downloads).
+	connectionStarted := time.Now()
+	conn, release, err := c.createPooledConnection(ctx, *targetProvider)
 	if err != nil {
 		result.Error = fmt.Sprintf("connection failed: %v", err)
-		c.speedTestResults.Store(providerHost, result)
+		if c.providerMonitor != nil {
+			c.providerMonitor.setHealth(canonicalProviderKey(*targetProvider), ProviderHealth{
+				Status: "unhealthy", CheckedAt: result.TestedAt.Format(time.RFC3339),
+				Error: sanitizeProviderError(err, *targetProvider),
+			})
+		}
 		return result
 	}
-	defer func(conn *Connection) {
-		_ = conn.Close()
-	}(conn)
+	connectionLatency := time.Since(connectionStarted).Milliseconds()
+	defer release()
 
 	// Measure latency using ping (true network RTT)
 	pingStart := utils.Now()
 	if err := conn.ping(); err != nil {
-		result.Error = fmt.Sprintf("ping failed: %v", err)
-		c.speedTestResults.Store(providerHost, result)
+		message := sanitizeProviderError(err, *targetProvider)
+		if strings.Contains(strings.ToLower(message), "unexpected date response") {
+			// DATE is optional on some otherwise usable providers. Use the full
+			// connection/TLS/authentication time as the latency measurement and
+			// continue to the BODY throughput test.
+			result.LatencyMs = connectionLatency
+			if c.providerMonitor != nil {
+				c.providerMonitor.setHealth(canonicalProviderKey(*targetProvider), ProviderHealth{
+					Status: "healthy", CheckedAt: result.TestedAt.Format(time.RFC3339),
+					Detail: "Authenticated successfully; DATE is not supported by this server",
+				})
+			}
+		} else {
+			result.Error = fmt.Sprintf("ping failed: %v", err)
+			if c.providerMonitor != nil {
+				c.providerMonitor.setHealth(canonicalProviderKey(*targetProvider), ProviderHealth{
+					Status: "unknown", CheckedAt: result.TestedAt.Format(time.RFC3339), Error: message,
+				})
+			}
+			return result
+		}
+	} else {
+		result.LatencyMs = time.Since(pingStart).Milliseconds()
+		if c.providerMonitor != nil {
+			latency := result.LatencyMs
+			c.providerMonitor.setHealth(canonicalProviderKey(*targetProvider), ProviderHealth{
+				Status: "healthy", CheckedAt: result.TestedAt.Format(time.RFC3339), LatencyMs: &latency,
+			})
+		}
+	}
+
+	measured := measureProviderSpeed(ctx, *targetProvider, messageIDs, result.TestedAt, result.LatencyMs, c.createPooledConnection)
+	result.SpeedMBps = measured.SpeedMBps
+	result.BytesRead = measured.BytesRead
+	result.Error = measured.Error
+
+	return result
+}
+
+func measureProviderSpeed(
+	ctx context.Context,
+	provider config.UsenetProvider,
+	messageIDs []string,
+	testedAt time.Time,
+	latencyMs int64,
+	openConnection func(context.Context, config.UsenetProvider) (*Connection, func(), error),
+) SpeedTestResult {
+	result := SpeedTestResult{Provider: provider.Host, TestedAt: testedAt, LatencyMs: latencyMs}
+	if len(messageIDs) == 0 {
+		result.Error = "no NZB article is available for a throughput test"
 		return result
 	}
-	result.LatencyMs = time.Since(pingStart).Milliseconds()
 
-	// If no messageID provided, just return latency
-	if messageID == "" {
-		c.speedTestResults.Store(providerHost, result)
-		return result
+	var lastErr error
+	for _, messageID := range messageIDs {
+		if ctx.Err() != nil {
+			lastErr = ctx.Err()
+			break
+		}
+		conn, release, err := openConnection(ctx, provider)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		downloadStart := time.Now()
+		data, downloadErr := conn.GetBody(messageID)
+		downloadDuration := time.Since(downloadStart)
+		release()
+		if downloadErr != nil {
+			lastErr = downloadErr
+			continue
+		}
+		result.BytesRead = int64(len(data))
+		if downloadDuration > 0 && result.BytesRead > 0 {
+			result.SpeedMBps = float64(result.BytesRead) / downloadDuration.Seconds() / (1024 * 1024)
+			return result
+		}
+		lastErr = errors.New("article body was empty")
 	}
 
-	// Download the segment to measure actual speed
-	downloadStart := utils.Now()
-	data, err := conn.GetBody(messageID)
-	downloadDuration := time.Since(downloadStart)
-
-	if err != nil {
-		result.Error = fmt.Sprintf("download failed: %v", err)
-		c.speedTestResults.Store(providerHost, result)
-		return result
+	result.Error = "no usable NZB article was found for this provider"
+	if lastErr != nil {
+		result.Error += ": " + sanitizeProviderError(lastErr, provider)
 	}
-
-	result.BytesRead = int64(len(data))
-
-	// Calculate speed in MB/s
-	if downloadDuration.Seconds() > 0 {
-		result.SpeedMBps = float64(result.BytesRead) / downloadDuration.Seconds() / (1024 * 1024)
-	}
-
-	c.speedTestResults.Store(providerHost, result)
 	return result
 }
 
@@ -1541,6 +1661,14 @@ func (c *Client) GetSpeedTestResults() map[string]SpeedTestResult {
 		return true
 	})
 	return results
+}
+
+// FlushProviderMetrics persists any usage reported after connection shutdown.
+// Usenet calls this after all active readers have completed cleanup.
+func (c *Client) FlushProviderMetrics() {
+	if c.providerMonitor != nil {
+		c.providerMonitor.Flush()
+	}
 }
 
 // GetSpeedTestResult returns the speed test result for a specific provider

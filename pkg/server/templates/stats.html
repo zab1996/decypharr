@@ -420,6 +420,8 @@
         const errorEl = document.getElementById('error-stats');
         const refreshBtn = document.getElementById('refresh-stats');
         const retryBtn = document.getElementById('retry-stats');
+        let statsLoaded = false;
+        let statsRequestInFlight = false;
 
         // Tab switching
         const tabs = document.querySelectorAll('[role="tab"]');
@@ -1182,16 +1184,41 @@
 
                 nntpProviders.forEach(provider => {
                     const speedTest = provider.speed_test;
+					const health = provider.health || {status: 'unknown'};
+					const usage = provider.usage || {};
+					const healthStatus = health.status || 'unknown';
+					const healthClass = healthStatus === 'healthy'
+						? 'badge-success'
+						: (healthStatus === 'unhealthy' ? 'badge-error' : 'badge-ghost');
+					const healthIcon = healthStatus === 'healthy'
+						? 'bi-check-circle'
+						: (healthStatus === 'unhealthy' ? 'bi-x-circle' : 'bi-question-circle');
+					const checkedAt = health.checked_at
+						? new Date(health.checked_at).toLocaleString()
+						: 'Not checked yet';
+					const latencyText = health.latency_ms !== undefined && health.latency_ms !== null
+						? ` · ${health.latency_ms}ms`
+						: '';
+					const speedTestText = speedTest && !speedTest.error && speedTest.speed_mbps > 0
+						? ` · Last test ${speedTest.speed_mbps.toFixed(1)} MB/s`
+						: '';
+					const usageWindowEnd = usage.window_end
+						? new Date(`${usage.window_end}T00:00:00`).toLocaleDateString()
+						: '';
+					const healthMessage = health.error || health.detail || '';
+					const healthMessageClass = health.error ? 'text-error' : 'text-warning';
                     let speedResultHtml = '';
                     if (speedTest && speedTest.tested_at) {
-                        const testedAt = new Date(speedTest.tested_at).toLocaleTimeString();
-                        if (speedTest.error) {
-                            speedResultHtml = `<span class="text-error text-xs"><i class="bi bi-x-circle"></i> Error</span>`;
-                        } else {
-                            const speedStr = speedTest.speed_mbps > 0
-                                ? `${speedTest.speed_mbps.toFixed(1)} MB/s`
-                                : `${speedTest.latency_ms}ms`;
-                            speedResultHtml = `<span class="text-success text-xs"><i class="bi bi-check-circle"></i> ${speedStr}</span>`;
+						const speedTestAgeMs = Date.now() - new Date(speedTest.tested_at).getTime();
+						if (speedTestAgeMs >= 0 && speedTestAgeMs < 60000) {
+							if (speedTest.error) {
+								speedResultHtml = `<span class="text-error text-xs"><i class="bi bi-x-circle"></i> Error</span>`;
+							} else {
+								const speedStr = speedTest.speed_mbps > 0
+									? `${speedTest.speed_mbps.toFixed(1)} MB/s`
+									: `${speedTest.latency_ms}ms`;
+								speedResultHtml = `<span class="text-success text-xs"><i class="bi bi-check-circle"></i> ${speedStr}</span>`;
+							}
                         }
                     }
 
@@ -1207,6 +1234,10 @@
                                         <p class="text-xs text-base-content/70">${provider.max_connections || 0} connections</p>
                                     </div>
                                     <div class="flex flex-col items-end gap-1">
+										<span class="badge ${healthClass} badge-sm gap-1">
+											<i class="bi ${healthIcon}"></i>
+											${healthStatus}
+										</span>
                                         ${speedResultHtml}
                                         <button
                                             class="btn btn-xs btn-ghost speed-test-btn"
@@ -1217,6 +1248,25 @@
                                         </button>
                                     </div>
                                 </div>
+								<div class="grid grid-cols-2 gap-2 mt-2 rounded bg-base-200 p-2">
+									<div>
+										<div class="text-xs text-base-content/60">Downloaded today</div>
+										<div class="text-sm font-medium">${window.decypharrUtils.formatBytes(usage.today_bytes || 0)}</div>
+									</div>
+									<div>
+										<div class="text-xs text-base-content/60">Current 30-day period</div>
+										<div class="text-sm font-medium">${window.decypharrUtils.formatBytes(usage.period_30d_bytes || 0)}</div>
+										${usageWindowEnd ? `<div class="text-xs text-base-content/50">Resets after ${usageWindowEnd}</div>` : ''}
+									</div>
+								</div>
+								<div id="health-summary-${provider.host.replace(/\./g, '-')}" class="text-xs text-base-content/50 mt-2">
+									Health checked: ${checkedAt}${latencyText}${speedTestText}
+								</div>
+								${healthMessage ? `
+									<div class="text-xs ${healthMessageClass} mt-1 break-words" title="${window.decypharrUtils.escapeHtml(healthMessage)}">
+										${window.decypharrUtils.escapeHtml(healthMessage)}
+									</div>
+								` : ''}
                                 <div id="speed-result-${provider.host.replace(/\./g, '-')}" class="text-xs mt-1"></div>
                             </div>
                         </div>
@@ -1316,8 +1366,12 @@
             updateActiveStreams(stats.active_streams);
         }
 
-        function loadStats() {
-            showLoading();
+        function loadStats({showInitialLoading = false} = {}) {
+            if (statsRequestInFlight) return;
+            statsRequestInFlight = true;
+            if (showInitialLoading && !statsLoaded) {
+                showLoading();
+            }
 
             fetch(`${window.urlBase}debug/stats`)
                 .then(response => {
@@ -1328,11 +1382,17 @@
                 })
                 .then(stats => {
                     updateStats(stats);
+                    statsLoaded = true;
                     showContent();
                 })
                 .catch(error => {
                     console.error('Error loading stats:', error);
-                    showError(error.message || 'Failed to load statistics');
+                    if (!statsLoaded) {
+                        showError(error.message || 'Failed to load statistics');
+                    }
+                })
+                .finally(() => {
+                    statsRequestInFlight = false;
                 });
         }
 
@@ -1365,11 +1425,21 @@
                     resultDiv.innerHTML = `<span class="text-error"><i class="bi bi-x-circle"></i> ${result.error}</span>`;
                 } else {
                     const testedAt = result.tested_at ? new Date(result.tested_at).toLocaleTimeString() : '';
+                    const speedDisplay = result.speed_mbps > 0 ? `${result.speed_mbps.toFixed(1)} MB/s` : '-';
+					const healthSummary = document.getElementById(`health-summary-${providerHost.replace(/\./g, '-')}`);
+					if (healthSummary) {
+						const checkedAt = result.tested_at ? new Date(result.tested_at).toLocaleString() : 'Just now';
+						healthSummary.textContent = `Health checked: ${checkedAt} · ${result.latency_ms || 0}ms · Last test ${speedDisplay}`;
+					}
                     resultDiv.innerHTML = `
                         <div class="flex items-center gap-2">
                             <i class="bi bi-check-circle text-success"></i>
                             <span><strong>${result.latency_ms || 0}ms</strong> latency</span>
                         </div>
+						<div class="flex items-center gap-2 text-success">
+							<i class="bi bi-speedometer2"></i>
+							<span><strong>${speedDisplay}</strong></span>
+						</div>
                         <div class="text-xs text-base-content/50 mt-1">Tested: ${testedAt}</div>
                     `;
                 }
@@ -1433,14 +1503,14 @@
         };
 
         // Event listeners
-        refreshBtn.addEventListener('click', loadStats);
-        retryBtn.addEventListener('click', loadStats);
+        refreshBtn.addEventListener('click', () => loadStats());
+        retryBtn.addEventListener('click', () => loadStats({showInitialLoading: true}));
 
         // Auto-refresh every 30 seconds
         setInterval(loadStats, 30000);
 
         // Initial load
-        loadStats();
+        loadStats({showInitialLoading: true});
     });
 </script>
 {{ end }}
