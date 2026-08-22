@@ -253,6 +253,44 @@ func TestIsCircuitOpen_CooldownExpiryDecrementsGauge(t *testing.T) {
 	}
 }
 
+// Close is a third way a Downloaders' life can end (alongside StopAll and
+// checkIdleTimeout, both of which already release the cache-wide
+// circuitBreakers gauge slot on their way out) — an item can be torn down
+// via idle-timeout eviction, a forced close, or process shutdown while its
+// breaker happens to be open, and Close previously never released that slot.
+func TestClose_ResetsOpenCircuitBreaker(t *testing.T) {
+	cache := &Cache{}
+	item := &CacheItem{cache: cache}
+	parentCtx := context.Background()
+	ctx, cancel := context.WithCancel(parentCtx)
+
+	dls := &Downloaders{
+		item:      item,
+		parentCtx: parentCtx,
+		ctx:       ctx,
+		cancel:    cancel,
+	}
+
+	dls.mu.Lock()
+	dls.openCircuitLocked()
+	dls.mu.Unlock()
+
+	if got := cache.circuitBreakers.Load(); got != 1 {
+		t.Fatalf("expected circuitBreakers gauge = 1 after opening, got %d", got)
+	}
+
+	if err := dls.Close(nil); err != nil {
+		t.Fatalf("Close returned error: %v", err)
+	}
+
+	if dls.circuitOpen.Load() {
+		t.Fatal("expected circuitOpen to be cleared after Close")
+	}
+	if got := cache.circuitBreakers.Load(); got != 0 {
+		t.Fatalf("expected circuitBreakers gauge decremented back to 0, got %d", got)
+	}
+}
+
 func TestNoProgressWatchdogCancelsStalledAttempt(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

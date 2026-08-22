@@ -683,6 +683,14 @@ func (dls *Downloaders) Close(inErr error) error {
 	}
 	dls.closed = true
 	dls.untrackStreamLocked()
+	// An item can be torn down (idle-timeout eviction, a forced close, or
+	// process shutdown) while its circuit breaker happens to be open.
+	// StopAll and checkIdleTimeout both release the cache-wide
+	// circuitBreakers gauge slot on their way out; Close is the third path
+	// that can end a Downloaders' life and needs the same release, or the
+	// gauge leaks permanently for any item that never went through the
+	// other two.
+	dls.resetCircuitLocked()
 
 	// Copy slice before unlocking to avoid races while waiting.
 	dlsCopy := make([]*downloader, len(dls.dls))
