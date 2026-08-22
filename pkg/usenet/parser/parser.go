@@ -616,8 +616,13 @@ func (p *NZBParser) groupProcessedFiles(allFiles []contentResult) map[string]*Fi
 			group.ActualFilename = item.actualFilename
 		}
 
-		// Update filename
-		item.file.Filename = item.actualFilename
+		// Update filename — only when content detection actually produced
+		// one. A file whose yEnc header carried no name would otherwise
+		// blank out a perfectly good subject-derived filename, losing the
+		// only extension source for that file.
+		if item.actualFilename != "" {
+			item.file.Filename = item.actualFilename
+		}
 
 		group.Files = append(group.Files, item.file)
 		for _, g := range item.file.Groups {
