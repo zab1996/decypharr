@@ -777,6 +777,28 @@ func (c *Client) tuneTCP(tcpConn *net.TCPConn) {
 }
 
 // createConnection creates a new NNTP connection to a provider
+// createPooledConnection acquires a connection through the same
+// MaxConnections-limited pool that real downloads use, instead of dialing a
+// raw connection outside the pool's slot accounting. Used by the provider
+// health/speed-check paths so they can't push a provider's simultaneous
+// connection count above its configured cap during heavy download activity
+// (which either gets the extra connection rejected by the provider - a
+// false "unhealthy" reading - or, on stricter providers, can disrupt an
+// in-flight legitimate download).
+//
+// The returned release func MUST be called exactly once - never just
+// conn.Close(), which would leak the acquired semaphore slot permanently
+// and silently shrink the pool's effective MaxConnections by one until the
+// process restarts.
+func (c *Client) createPooledConnection(ctx context.Context, provider config.UsenetProvider) (*Connection, func(), error) {
+	conn, provider, err := c.getConnectionFromProvider(ctx, provider)
+	if err != nil {
+		return nil, func() {}, err
+	}
+	release := func() { c.returnOrReleaseConn(conn, provider) }
+	return conn, release, nil
+}
+
 func (c *Client) createConnection(ctx context.Context, provider config.UsenetProvider) (*Connection, error) {
 	address := fmt.Sprintf("%s:%d", provider.Host, provider.Port)
 
@@ -1429,9 +1451,11 @@ func (c *Client) SpeedTest(ctx context.Context, providerHost string, messageIDs 
 		}
 	}()
 
-	// Create connection
+	// Create connection (through the same pooled/MaxConnections-limited path
+	// real downloads use, so a manual speed test can't push this provider's
+	// connection count above its configured cap during active downloads).
 	connectionStarted := time.Now()
-	conn, err := c.createConnection(ctx, *targetProvider)
+	conn, release, err := c.createPooledConnection(ctx, *targetProvider)
 	if err != nil {
 		result.Error = fmt.Sprintf("connection failed: %v", err)
 		if c.providerMonitor != nil {
@@ -1443,9 +1467,7 @@ func (c *Client) SpeedTest(ctx context.Context, providerHost string, messageIDs 
 		return result
 	}
 	connectionLatency := time.Since(connectionStarted).Milliseconds()
-	defer func(conn *Connection) {
-		_ = conn.Close()
-	}(conn)
+	defer release()
 
 	// Measure latency using ping (true network RTT)
 	pingStart := utils.Now()
@@ -1481,7 +1503,7 @@ func (c *Client) SpeedTest(ctx context.Context, providerHost string, messageIDs 
 		}
 	}
 
-	measured := measureProviderSpeed(ctx, *targetProvider, messageIDs, result.TestedAt, result.LatencyMs, c.createConnection)
+	measured := measureProviderSpeed(ctx, *targetProvider, messageIDs, result.TestedAt, result.LatencyMs, c.createPooledConnection)
 	result.SpeedMBps = measured.SpeedMBps
 	result.BytesRead = measured.BytesRead
 	result.Error = measured.Error
@@ -1495,7 +1517,7 @@ func measureProviderSpeed(
 	messageIDs []string,
 	testedAt time.Time,
 	latencyMs int64,
-	openConnection func(context.Context, config.UsenetProvider) (*Connection, error),
+	openConnection func(context.Context, config.UsenetProvider) (*Connection, func(), error),
 ) SpeedTestResult {
 	result := SpeedTestResult{Provider: provider.Host, TestedAt: testedAt, LatencyMs: latencyMs}
 	if len(messageIDs) == 0 {
@@ -1509,7 +1531,7 @@ func measureProviderSpeed(
 			lastErr = ctx.Err()
 			break
 		}
-		conn, err := openConnection(ctx, provider)
+		conn, release, err := openConnection(ctx, provider)
 		if err != nil {
 			lastErr = err
 			continue
@@ -1517,7 +1539,7 @@ func measureProviderSpeed(
 		downloadStart := time.Now()
 		data, downloadErr := conn.GetBody(messageID)
 		downloadDuration := time.Since(downloadStart)
-		_ = conn.Close()
+		release()
 		if downloadErr != nil {
 			lastErr = downloadErr
 			continue

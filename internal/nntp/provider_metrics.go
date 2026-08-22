@@ -20,6 +20,14 @@ const (
 	providerHealthInterval  = time.Hour
 	providerUsageFlushEvery = 30 * time.Second
 	providerUsageDays       = 30
+
+	// providerCheckTimeout bounds a single provider's health+speed check.
+	// Pooled connections (see createPooledConnection) can legitimately block
+	// waiting for a free MaxConnections slot during heavy download activity -
+	// without a bound here, one busy provider could stall runHealthChecks'
+	// sequential loop indefinitely, delaying every other provider's check
+	// too, since the next iteration only starts once the current one returns.
+	providerCheckTimeout = 45 * time.Second
 )
 
 type ProviderHealth struct {
@@ -71,8 +79,14 @@ type providerMonitor struct {
 	now            func() time.Time
 	healthInterval time.Duration
 	flushInterval  time.Duration
-	checkProvider  func(context.Context, config.UsenetProvider) ProviderHealth
-	openConnection func(context.Context, config.UsenetProvider) (*Connection, error)
+	checkProvider func(context.Context, config.UsenetProvider) ProviderHealth
+	// openConnection acquires a connection through the client's pooled,
+	// MaxConnections-limited path (see createPooledConnection) rather than
+	// dialing a raw, unaccounted-for connection - so health/speed checks
+	// can't push a provider's simultaneous connection count above its
+	// configured cap during active downloads. The returned release func
+	// must always be called, never just conn.Close().
+	openConnection func(context.Context, config.UsenetProvider) (*Connection, func(), error)
 	testSegments   func() []string
 
 	ctx          context.Context
@@ -117,7 +131,7 @@ func newProviderMonitorWithClock(client *Client, providers []config.UsenetProvid
 	}
 	m.checkProvider = m.performHealthCheck
 	if client != nil {
-		m.openConnection = client.createConnection
+		m.openConnection = client.createPooledConnection
 	}
 	m.load()
 	return m
@@ -279,7 +293,10 @@ func (m *providerMonitor) runHealthChecks(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		m.setHealth(canonicalProviderKey(provider), m.checkProvider(ctx, provider))
+		checkCtx, cancel := context.WithTimeout(ctx, providerCheckTimeout)
+		health := m.checkProvider(checkCtx, provider)
+		cancel()
+		m.setHealth(canonicalProviderKey(provider), health)
 	}
 }
 
@@ -289,14 +306,14 @@ func (m *providerMonitor) performHealthCheck(ctx context.Context, provider confi
 	if m.openConnection == nil {
 		return ProviderHealth{Status: "unknown", CheckedAt: checkedAtText, Error: "health checker is unavailable"}
 	}
-	conn, err := m.openConnection(ctx, provider)
+	conn, release, err := m.openConnection(ctx, provider)
 	if err != nil {
 		return ProviderHealth{
 			Status: "unhealthy", CheckedAt: checkedAtText,
 			Error: sanitizeProviderError(err, provider),
 		}
 	}
-	defer func() { _ = conn.Close() }()
+	defer release()
 
 	pingStarted := time.Now()
 	if err := conn.ping(); err != nil {

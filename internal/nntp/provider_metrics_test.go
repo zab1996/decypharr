@@ -366,11 +366,11 @@ func TestHealthCheckClassification(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			provider := config.UsenetProvider{Host: "news.example.com", Port: 563, SSL: true}
 			m := newProviderMonitor(nil, []config.UsenetProvider{provider}, nil)
-			m.openConnection = func(context.Context, config.UsenetProvider) (*Connection, error) {
+			m.openConnection = func(context.Context, config.UsenetProvider) (*Connection, func(), error) {
 				if tc.openErr != nil {
-					return nil, tc.openErr
+					return nil, func() {}, tc.openErr
 				}
-				return dateTestConnection(t, tc.dateCode), nil
+				return dateTestConnection(t, tc.dateCode), func() {}, nil
 			}
 			health := m.performHealthCheck(context.Background(), provider)
 			if health.Status != tc.wantStatus {
@@ -458,11 +458,11 @@ func TestMeasureProviderSpeedRequiresBodyAndFallsBackToAnotherCandidate(t *testi
 	payload := bytes.Repeat([]byte("speed-test-body"), 64)
 	var usage atomic.Int64
 	var opens atomic.Int32
-	opener := func(context.Context, config.UsenetProvider) (*Connection, error) {
+	opener := func(context.Context, config.UsenetProvider) (*Connection, func(), error) {
 		if opens.Add(1) == 1 {
-			return missingBodyTestConnection(t), nil
+			return missingBodyTestConnection(t), func() {}, nil
 		}
-		return bodyTestConnection(t, payload, &usage), nil
+		return bodyTestConnection(t, payload, &usage), func() {}, nil
 	}
 	result := measureProviderSpeed(
 		context.Background(), provider, []string{"missing", "available"}, time.Now(), 51, opener,
@@ -487,11 +487,11 @@ func TestScheduledHealthRefreshAlsoStoresSpeed(t *testing.T) {
 	m.testSegments = func() []string { return []string{"available"} }
 	var usage atomic.Int64
 	var opens atomic.Int32
-	m.openConnection = func(context.Context, config.UsenetProvider) (*Connection, error) {
+	m.openConnection = func(context.Context, config.UsenetProvider) (*Connection, func(), error) {
 		if opens.Add(1) == 1 {
-			return dateTestConnection(t, 111), nil
+			return dateTestConnection(t, 111), func() {}, nil
 		}
-		return bodyTestConnection(t, bytes.Repeat([]byte("scheduled-speed"), 64), &usage), nil
+		return bodyTestConnection(t, bytes.Repeat([]byte("scheduled-speed"), 64), &usage), func() {}, nil
 	}
 
 	health := m.performHealthCheck(context.Background(), provider)
