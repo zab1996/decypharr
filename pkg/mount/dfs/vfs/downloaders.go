@@ -79,6 +79,12 @@ type Downloaders struct {
 	// It blocks the idle-restart path from spinning up a fresh kicker before
 	// the previous one has fully exited and the new ctx is installed.
 	stopping bool
+	// stopCond wakes DownloadWithPriority's stopping-wait once StopAll()
+	// finishes a teardown/resume cycle (stopping -> false) or Close()
+	// permanently ends the session (closed -> true). Locked on mu; created
+	// once in NewDownloaders since a Downloaders is reused across sessions,
+	// not reallocated per StopAll cycle.
+	stopCond *sync.Cond
 	// idle is true when all downloaders have stopped. Guarded by mu so that
 	// the restart decision in Download() and the teardown in StopAll() are
 	// serialized with kicker lifecycle changes.
@@ -243,6 +249,7 @@ func NewDownloaders(ctx context.Context, mgr *manager.Manager, item *CacheItem, 
 		// streamID is populated lazily when the first read occurs.
 		streamID: "",
 	}
+	dls.stopCond = sync.NewCond(&dls.mu)
 	dls.touchActivity() // Initialize activity timestamp
 
 	// Background kicker to handle stalled waiters and idle detection
@@ -279,11 +286,34 @@ func (dls *Downloaders) DownloadWithPriority(ctx context.Context, r ranges.Range
 		return errors.New("downloaders closed")
 	}
 
-	// Reject new work while StopAll() is tearing down the current session so
-	// we don't race a new stream/downloader against the teardown path.
+	// Wait out an in-progress StopAll() teardown instead of failing
+	// immediately. StopAll is designed to resume — it resets the error
+	// budget and circuit breaker and clears stopping once the new ctx is
+	// installed (see StopAll) — so a request that merely lands during the
+	// teardown window has nothing wrong with it. Failing it immediately used
+	// to mean a downloader spawned on the old, already-canceled ctx exited
+	// instantly and failed every pending waiter with a spurious read error,
+	// even though a fresh session was seconds away. This fires routinely,
+	// not just at shutdown: StopAll runs after every item.Release() grace
+	// period, not only on process exit.
 	if dls.stopping {
-		dls.mu.Unlock()
-		return errors.New("downloaders stopping")
+		stopWaiting := context.AfterFunc(ctx, func() {
+			dls.mu.Lock()
+			dls.stopCond.Broadcast()
+			dls.mu.Unlock()
+		})
+		for dls.stopping && !dls.closed {
+			dls.stopCond.Wait()
+		}
+		stopWaiting()
+		if dls.closed {
+			dls.mu.Unlock()
+			return errors.New("downloaders closed")
+		}
+		if err := ctx.Err(); err != nil {
+			dls.mu.Unlock()
+			return err
+		}
 	}
 
 	if err := dls.ctx.Err(); err != nil {
@@ -682,6 +712,11 @@ func (dls *Downloaders) Close(inErr error) error {
 		return nil
 	}
 	dls.closed = true
+	// Wake any DownloadWithPriority call still waiting out a stopping
+	// window — Close means this session is never resuming, so waiters must
+	// see closed=true and return the terminal error instead of blocking on
+	// a stopping->false transition that will now never come.
+	dls.stopCond.Broadcast()
 	dls.untrackStreamLocked()
 	// An item can be torn down (idle-timeout eviction, a forced close, or
 	// process shutdown) while its circuit breaker happens to be open.
@@ -905,6 +940,9 @@ func (dls *Downloaders) StopAll() {
 		dls.resetCircuitLocked()
 	}
 	dls.stopping = false
+	// Wake every DownloadWithPriority call waiting out this teardown — the
+	// new ctx (or, if Close raced us, closed=true) is now visible under mu.
+	dls.stopCond.Broadcast()
 	dls.mu.Unlock()
 }
 

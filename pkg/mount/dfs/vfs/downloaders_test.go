@@ -2,6 +2,7 @@ package vfs
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -162,6 +163,7 @@ func TestStopAllClearsWaiters(t *testing.T) {
 		ctx:       ctx,
 		cancel:    cancel,
 	}
+	dls.stopCond = sync.NewCond(&dls.mu)
 
 	errCh := make(chan error, 1)
 	dls.waiters = append(dls.waiters, waiter{
@@ -202,6 +204,7 @@ func TestCacheItemReleaseStopsDownloadersOnZeroOpens(t *testing.T) {
 		ctx:       ctx,
 		cancel:    cancel,
 	}
+	dls.stopCond = sync.NewCond(&dls.mu)
 
 	item := &CacheItem{
 		downloaders: dls,
@@ -270,6 +273,7 @@ func TestClose_ResetsOpenCircuitBreaker(t *testing.T) {
 		ctx:       ctx,
 		cancel:    cancel,
 	}
+	dls.stopCond = sync.NewCond(&dls.mu)
 
 	dls.mu.Lock()
 	dls.openCircuitLocked()
@@ -288,6 +292,103 @@ func TestClose_ResetsOpenCircuitBreaker(t *testing.T) {
 	}
 	if got := cache.circuitBreakers.Load(); got != 0 {
 		t.Fatalf("expected circuitBreakers gauge decremented back to 0, got %d", got)
+	}
+}
+
+// DownloadWithPriority used to fail immediately with "downloaders stopping"
+// whenever a request landed during a StopAll() teardown window — even
+// though StopAll is designed to resume the session (it clears stopping once
+// the new ctx is installed), not just to shut down. This proves the call
+// now blocks through that window and succeeds once stopping clears, instead
+// of failing a request whose only problem was timing.
+func TestDownloadWithPriority_WaitsThroughStoppingWindow(t *testing.T) {
+	parentCtx := context.Background()
+	ctx, cancel := context.WithCancel(parentCtx)
+	defer cancel()
+
+	item := &CacheItem{
+		info: ItemInfo{
+			Size: 1024,
+			Rs:   ranges.Ranges{{Pos: 0, Size: 1024}}, // fully present: no network needed
+		},
+	}
+
+	dls := &Downloaders{
+		parentCtx: parentCtx,
+		ctx:       ctx,
+		cancel:    cancel,
+		item:      item,
+	}
+	dls.stopCond = sync.NewCond(&dls.mu)
+	dls.stopping = true
+
+	unblocked := make(chan error, 1)
+	go func() {
+		unblocked <- dls.DownloadWithPriority(context.Background(), ranges.Range{Pos: 0, Size: 1024}, true)
+	}()
+
+	// Give the goroutine time to reach the wait and confirm it's actually
+	// blocked, not racing past a bug that no-ops the wait.
+	select {
+	case err := <-unblocked:
+		t.Fatalf("DownloadWithPriority returned early (err=%v) instead of waiting out the stopping window", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	dls.mu.Lock()
+	dls.stopping = false
+	dls.stopCond.Broadcast()
+	dls.mu.Unlock()
+
+	select {
+	case err := <-unblocked:
+		if err != nil {
+			t.Fatalf("DownloadWithPriority returned an error after stopping cleared: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("DownloadWithPriority did not unblock after stopping cleared and stopCond was broadcast")
+	}
+}
+
+// A Downloaders that is permanently Close()d while a caller is waiting out a
+// stopping window must wake that caller with the terminal error instead of
+// hanging forever waiting for a stopping->false transition that will now
+// never come.
+func TestDownloadWithPriority_ErrorsIfClosedWhileWaiting(t *testing.T) {
+	parentCtx := context.Background()
+	ctx, cancel := context.WithCancel(parentCtx)
+
+	dls := &Downloaders{
+		parentCtx: parentCtx,
+		ctx:       ctx,
+		cancel:    cancel,
+		item:      &CacheItem{info: ItemInfo{Size: 1024}},
+	}
+	dls.stopCond = sync.NewCond(&dls.mu)
+	dls.stopping = true
+
+	unblocked := make(chan error, 1)
+	go func() {
+		unblocked <- dls.DownloadWithPriority(context.Background(), ranges.Range{Pos: 0, Size: 1024}, true)
+	}()
+
+	select {
+	case err := <-unblocked:
+		t.Fatalf("DownloadWithPriority returned early (err=%v) instead of waiting", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	if err := dls.Close(nil); err != nil {
+		t.Fatalf("Close returned error: %v", err)
+	}
+
+	select {
+	case err := <-unblocked:
+		if err == nil {
+			t.Fatal("expected DownloadWithPriority to return an error once Close ran, got nil")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("DownloadWithPriority hung instead of waking up when Close ran")
 	}
 }
 
