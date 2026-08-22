@@ -392,6 +392,42 @@ func TestDownloadWithPriority_ErrorsIfClosedWhileWaiting(t *testing.T) {
 	}
 }
 
+// A caller with no deadline of its own (context.Background(), the FUSE read
+// path's usual case) must not hang forever if stopping never clears — the
+// internal maxStoppingWaitNanos safety net must fire and return a clear
+// error instead.
+func TestDownloadWithPriority_TimesOutIfStoppingNeverClears(t *testing.T) {
+	prevWait := maxStoppingWaitNanos.Swap(int64(50 * time.Millisecond))
+	t.Cleanup(func() { maxStoppingWaitNanos.Store(prevWait) })
+
+	parentCtx := context.Background()
+	ctx, cancel := context.WithCancel(parentCtx)
+	defer cancel()
+
+	dls := &Downloaders{
+		parentCtx: parentCtx,
+		ctx:       ctx,
+		cancel:    cancel,
+		item:      &CacheItem{info: ItemInfo{Size: 1024}},
+	}
+	dls.stopCond = sync.NewCond(&dls.mu)
+	dls.stopping = true // deliberately never cleared
+
+	unblocked := make(chan error, 1)
+	go func() {
+		unblocked <- dls.DownloadWithPriority(context.Background(), ranges.Range{Pos: 0, Size: 1024}, true)
+	}()
+
+	select {
+	case err := <-unblocked:
+		if err == nil {
+			t.Fatal("expected DownloadWithPriority to time out and return an error, got nil")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("DownloadWithPriority hung past the shortened safety-net timeout — stuck stopping=true should degrade to an error, not a permanent hang")
+	}
+}
+
 func TestNoProgressWatchdogCancelsStalledAttempt(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

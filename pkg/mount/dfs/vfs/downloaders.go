@@ -58,6 +58,20 @@ const (
 	minSuccessfulChunksBeforeGrowth = 2
 )
 
+// maxStoppingWaitNanos bounds how long DownloadWithPriority waits for an
+// in-progress StopAll() teardown to resume before giving up. A normal cycle
+// finishes in well under this (StopAll waits on in-flight downloaders and the
+// kicker, then reinstalls a fresh ctx) — this exists purely as a safety net
+// so a stuck stopping=true state from a bug elsewhere degrades to a clear
+// error instead of hanging a caller that passed a context with no deadline
+// of its own. A var (not a const) so tests can shrink it, matching
+// releaseStopGracePeriodNanos in cache.go.
+var maxStoppingWaitNanos atomic.Int64
+
+func init() {
+	maxStoppingWaitNanos.Store(int64(30 * time.Second))
+}
+
 // Downloaders coordinates multiple concurrent downloads to a cache item
 type Downloaders struct {
 	parentCtx     context.Context
@@ -297,22 +311,47 @@ func (dls *Downloaders) DownloadWithPriority(ctx context.Context, r ranges.Range
 	// not just at shutdown: StopAll runs after every item.Release() grace
 	// period, not only on process exit.
 	if dls.stopping {
-		stopWaiting := context.AfterFunc(ctx, func() {
+		// waitCtx bounds the wait independently of the caller's own ctx — a
+		// caller with no deadline of its own (context.Background()) must
+		// still not hang forever if stopping never clears due to a bug
+		// elsewhere in this file's teardown/resume path.
+		maxWait := time.Duration(maxStoppingWaitNanos.Load())
+		waitCtx, cancelWait := context.WithTimeout(ctx, maxWait)
+		stopWaiting := context.AfterFunc(waitCtx, func() {
 			dls.mu.Lock()
 			dls.stopCond.Broadcast()
 			dls.mu.Unlock()
 		})
-		for dls.stopping && !dls.closed {
+		// waitCtx.Err() must be part of the loop condition, not just checked
+		// after: the AfterFunc broadcasts once when waitCtx becomes Done, but
+		// if stopping is still true at that point (the safety-net timeout
+		// firing, or the caller's own ctx being canceled) the broadcast alone
+		// doesn't stop the loop — without this check it would just re-enter
+		// Wait() and block forever, since nothing broadcasts a second time.
+		for dls.stopping && !dls.closed && waitCtx.Err() == nil {
 			dls.stopCond.Wait()
 		}
 		stopWaiting()
+		// Capture the wait error before canceling waitCtx ourselves below —
+		// cancelWait() unconditionally marks it Canceled, which would
+		// otherwise make even the successful (stopping cleared normally)
+		// path look like it had timed out.
+		waitErr := waitCtx.Err()
+		cancelWait()
 		if dls.closed {
 			dls.mu.Unlock()
 			return errors.New("downloaders closed")
 		}
-		if err := ctx.Err(); err != nil {
+		if waitErr != nil {
 			dls.mu.Unlock()
-			return err
+			if ctx.Err() == nil {
+				// Only our internal safety timeout fired; the caller's own
+				// ctx is still fine. Surface a clear, specific error instead
+				// of a bare "deadline exceeded" that looks like the caller's
+				// own timeout tripped.
+				return fmt.Errorf("timed out after %s waiting for downloaders to resume from stopping: %w", maxWait, waitErr)
+			}
+			return ctx.Err()
 		}
 	}
 
