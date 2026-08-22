@@ -83,6 +83,37 @@ func TestDetectFileTypeFromContent_ExactBoundaryDoesNotPanic(t *testing.T) {
 	}
 }
 
+// getNZBSegments rejects a file with a holed or duplicate segment range by
+// returning (0, nil) rather than the pre-existing zero-filled-slot behavior.
+// processMediaFile must in turn reject the whole file instead of splicing
+// that hole into the merged output stream.
+func TestProcessMediaFile_RejectsFileWithInvalidSegmentRange(t *testing.T) {
+	p := &NZBParser{}
+
+	group := &FileGroup{
+		BaseName: "movie",
+		Type:     storage.NZBFileTypeMedia,
+		Groups:   map[string]struct{}{},
+		Files: []nzbparser.NzbFile{
+			{
+				Filename: "movie.mkv",
+				Number:   1,
+				Segments: nzbparser.NzbSegments{
+					{Number: 1, Id: "a", Bytes: 1000},
+					{Number: 2, Id: "b", Bytes: 1000},
+					{Number: 2, Id: "c", Bytes: 1000}, // duplicate
+					{Number: 4, Id: "d", Bytes: 1000},
+				},
+			},
+		},
+	}
+
+	got := p.processMediaFile(group, "")
+	if got != nil {
+		t.Fatalf("expected processMediaFile to reject a file with an invalid segment range, got %+v", got)
+	}
+}
+
 func TestDetectFileTypeFromContent_TrueTSPacketDetected(t *testing.T) {
 	p := &NZBParser{}
 	data := make([]byte, 189)

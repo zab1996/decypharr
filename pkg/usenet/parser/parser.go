@@ -1050,6 +1050,16 @@ func (p *NZBParser) processMediaFile(group *FileGroup, password string) *storage
 	currentOffset := int64(0)
 	for index, nzbFile := range group.Files {
 		totalSize, segments := getNZBSegments(index, nzbFile, group)
+		if len(segments) == 0 && len(nzbFile.Segments) > 0 {
+			// getNZBSegments rejected this file's segment range (holed,
+			// duplicate, or an unfetchable segment) rather than the file
+			// genuinely having no segments. Splicing a hole into the merged
+			// stream here would produce a file whose offsets don't line up
+			// with its actual data — reject the whole file instead.
+			p.logger.Warn().Str("file", nzbFile.Filename).Str("group", group.BaseName).
+				Msg("rejecting media file: segment validation failed")
+			return nil
+		}
 		file.Segments = append(file.Segments, segments...)
 		currentOffset += totalSize
 	}
