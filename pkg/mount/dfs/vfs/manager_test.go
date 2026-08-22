@@ -1,7 +1,10 @@
 package vfs
 
 import (
+	"runtime"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/puzpuzpuz/xsync/v4"
 )
@@ -97,5 +100,85 @@ func TestGetFileFastPathHappyCase(t *testing.T) {
 	}
 	if entry.refCount.Load() != 2 {
 		t.Fatalf("expected refCount 2 (1 initial + 1 from this open), got %d", entry.refCount.Load())
+	}
+}
+
+// getFile's other two claimed-item branches (the LoadOrStore-loaded branch,
+// and the "just created by us" branch) are genuine TOCTOU races: the claim
+// has to land in the gap between GetItem returning an item and Open() being
+// called on it, which can't be reproduced by pre-seeding static state the
+// way TestGetFileEvictsStaleEntryOnClaimedItem does for the fast path. This
+// hammers getFile against a background goroutine that continuously
+// claims-and-replaces the cache item to generate that contention for real,
+// and asserts getFile never hard-fails — before the retry loop existed, any
+// call that observed the item mid-claim on either of those branches
+// returned an error instead of retrying, which under real churn showed up
+// as sporadic EIO to the FUSE caller. Run with -race.
+func TestGetFile_ConcurrentClaimChurnNeverHardFails(t *testing.T) {
+	const parent, name = "entry", "file.mkv"
+	cacheKey := buildCacheKey(parent, name)
+
+	m := &Manager{
+		cache: &Cache{items: xsync.NewMap[string, *CacheItem]()},
+		files: xsync.NewMap[string, *fileEntry](),
+	}
+	m.cache.items.Store(cacheKey, &CacheItem{info: ItemInfo{Size: 4096}})
+
+	stop := make(chan struct{})
+	var churnWG sync.WaitGroup
+	churnWG.Add(1)
+	go func() {
+		defer churnWG.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			// Best-effort claim of whatever item is currently there (a no-op
+			// if it has open handles or is already claimed), then
+			// unconditionally replace it — simulating a forced purge
+			// followed by GetItem creating a fresh item, over and over.
+			if item, ok := m.cache.items.Load(cacheKey); ok {
+				item.claimForClose()
+			}
+			m.cache.items.Store(cacheKey, &CacheItem{info: ItemInfo{Size: 4096}})
+			runtime.Gosched()
+		}
+	}()
+
+	const goroutines, iterations = 20, 50
+	var wg sync.WaitGroup
+	errCh := make(chan error, goroutines*iterations)
+	for range goroutines {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range iterations {
+				if _, err := m.getFile(parent, name, 4096); err != nil {
+					errCh <- err
+				}
+			}
+		}()
+	}
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("getFile calls did not complete under claim churn — possible hang in the retry loop")
+	}
+
+	close(stop)
+	churnWG.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		t.Errorf("getFile returned a hard error under concurrent claim churn: %v", err)
 	}
 }
