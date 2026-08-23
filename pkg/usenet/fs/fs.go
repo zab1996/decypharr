@@ -225,7 +225,10 @@ func (f *FS) createNewReaderForVolume(vol *types.Volume) (PrefetchableReaderAt, 
 	// Configure the new reader
 	readerConfig := reader.DefaultConfig()
 	readerConfig.MaxConnections = f.maxConcurrent
-	readerConfig.PrefetchAhead = 8 // prefetch ahead count
+	readerConfig.PrefetchAhead = 8 // prefetch ahead count (default)
+	if cfg.Usenet.PrefetchAheadSegments > 0 {
+		readerConfig.PrefetchAhead = cfg.Usenet.PrefetchAheadSegments
+	}
 	readerConfig.DiskPath = cfg.Usenet.DiskBufferPath
 
 	// Create the new streaming reader
