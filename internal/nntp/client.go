@@ -1127,6 +1127,11 @@ func (c *Client) Stats() map[string]interface{} {
 			"ssl":             p.SSL,
 		}
 
+		if p.SubscriptionExpiry != "" {
+			providerInfo["subscription_expiry"] = p.SubscriptionExpiry
+			providerInfo["auto_renew"] = p.AutoRenew
+		}
+
 		if c.providerMonitor != nil {
 			health, usage := c.providerMonitor.Stats(p)
 			providerInfo["provider_key"] = canonicalProviderKey(p)

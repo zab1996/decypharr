@@ -38,7 +38,7 @@ type UsenetProvider struct {
 	// handshake before the first byte can be requested. Default 0 (off) -
 	// purely reactive dialing, matching prior behavior.
 	MinIdleConnections int `json:"min_idle_connections,omitempty"`
-	Priority       int    `json:"priority,omitempty"`        // Priority for this provider (lower = higher priority)
+	Priority           int `json:"priority,omitempty"` // Priority for this provider (lower = higher priority)
 	// Backup marks this provider as a fallback tier. Backups are only
 	// consulted when every non-backup ("primary") provider is excluded
 	// — e.g. all primaries returned article-not-found or had connection
@@ -48,6 +48,13 @@ type UsenetProvider struct {
 	// other Usenet clients implement, and prevents block providers from
 	// being billed for articles the unlimited could have served.
 	Backup bool `json:"backup,omitempty"`
+
+	// SubscriptionExpiry/AutoRenew are informational only - purely for
+	// surfacing subscription status in Settings/Stats so users can keep
+	// track of when a provider's plan runs out. Never read by any
+	// connection/download logic.
+	SubscriptionExpiry string `json:"subscription_expiry,omitempty"` // Optional plan end date, e.g. "2026-12-31"
+	AutoRenew          bool   `json:"auto_renew,omitempty"`          // Whether the subscription is set to auto-renew
 }
 
 // Usenet configuration for usenet streaming and downloading
