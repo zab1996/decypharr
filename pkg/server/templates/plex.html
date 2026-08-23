@@ -122,8 +122,32 @@
                 const text = await res.text();
                 throw new Error(text || ('HTTP ' + res.status));
             }
-            statusEl.textContent = 'Saved — restart may be required to apply.';
+
+            let restarted = true;
+            try {
+                const result = await res.json();
+                restarted = result.restarted !== false;
+            } catch (_) {
+                // Older backends return no body; assume a restart happened.
+            }
+
             currentConfig = cfg;
+            if (restarted) {
+                statusEl.textContent = 'Saved. Services are restarting…';
+                if (window.decypharrUtils) {
+                    window.decypharrUtils.createToast('Configuration saved successfully! Services are restarting...', 'success');
+                }
+                // Reload page after a delay to allow services to restart -
+                // same timing the main Settings page uses (config.js).
+                setTimeout(() => {
+                    window.location.reload();
+                }, 2000);
+            } else {
+                statusEl.textContent = 'Saved and applied.';
+                if (window.decypharrUtils) {
+                    window.decypharrUtils.createToast('Configuration saved and applied.', 'success');
+                }
+            }
         } catch (err) {
             statusEl.textContent = 'Failed to save: ' + err.message;
         }
