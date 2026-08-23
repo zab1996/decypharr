@@ -90,6 +90,18 @@ func (f *File) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, s
 			f.logger.Error().Err(err).Str("file", f.info.Name()).Msg("Failed to get reader at open")
 			return nil, 0, syscall.EIO
 		}
+		// Warm the head/tail segment cache in the background so it's already
+		// available by the time the client's first Read() lands, instead of
+		// that Read() paying full cold NNTP fetch+decode latency itself.
+		if f.info.ActiveDebrid() == "usenet" {
+			go func(info *manager.FileInfo) {
+				if mgr := f.vfs.Manager(); mgr != nil {
+					if err := mgr.PreCacheUsenetFile(context.Background(), info.InfoHash(), info.Name()); err != nil {
+						f.logger.Debug().Err(err).Str("file", info.Name()).Msg("Pre-cache at open failed")
+					}
+				}
+			}(f.info)
+		}
 	}
 
 	fh := &Handle{

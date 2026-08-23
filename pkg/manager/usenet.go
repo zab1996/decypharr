@@ -153,6 +153,16 @@ func (m *Manager) HasUsenet() bool {
 	return m.usenet != nil
 }
 
+// PreCacheUsenetFile warms the head/tail segment cache for a usenet file
+// ahead of the first real Read, via the shared entry/reader Usenet.Stream
+// also uses. No-op if usenet isn't configured.
+func (m *Manager) PreCacheUsenetFile(ctx context.Context, nzoID, filename string) error {
+	if m.usenet == nil {
+		return nil
+	}
+	return m.usenet.PreCache(ctx, nzoID, filename)
+}
+
 // UsenetStats returns usenet client statistics
 func (m *Manager) UsenetStats() map[string]interface{} {
 	if m.usenet == nil {

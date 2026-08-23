@@ -32,6 +32,12 @@ type UsenetProvider struct {
 	Backbone       string `json:"backbone,omitempty"`        // Shared article backbone identifier used for failover decisions
 	MaxConnections int    `json:"max_connections,omitempty"` // Max connections for this provider (default: 10)
 	SSL            bool   `json:"ssl,omitempty"`             // Use SSL/TLS for the connection
+	// MinIdleConnections keeps this many idle connections pre-dialed and
+	// pooled at all times, so the first file open of a session (or any open
+	// after the pool has gone fully idle) doesn't pay a fresh TCP+TLS+AUTH
+	// handshake before the first byte can be requested. Default 0 (off) -
+	// purely reactive dialing, matching prior behavior.
+	MinIdleConnections int `json:"min_idle_connections,omitempty"`
 	Priority       int    `json:"priority,omitempty"`        // Priority for this provider (lower = higher priority)
 	// Backup marks this provider as a fallback tier. Backups are only
 	// consulted when every non-backup ("primary") provider is excluded
@@ -52,6 +58,10 @@ type Usenet struct {
 	ProcessingMaxConnections int `json:"processing_max_connections,omitempty"` // Maximum concurrent connections per file for parsing and NZB downloads (default: max_connections)
 	// Read-ahead configuration
 	ReadAhead string `json:"read_ahead,omitempty"` // Bytes to prefetch ahead of streaming reads e.g. "16MB", "32MB" (default: 16MB)
+	// PrefetchAheadSegments is how many segments beyond the requested range
+	// the streaming reader queues for read-ahead. Default 0 -> 8 (prior
+	// hardcoded value).
+	PrefetchAheadSegments int `json:"prefetch_ahead_segments,omitempty"`
 	// SocketReadBuffer / SocketWriteBuffer set the per-connection TCP
 	// SO_RCVBUF / SO_SNDBUF (e.g. "4MB"). At high RTT a single connection's
 	// throughput is capped at roughly buffer ÷ RTT, so the receive buffer must

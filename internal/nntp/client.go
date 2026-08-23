@@ -231,6 +231,9 @@ func NewClient(cfg *config.Config, metricStores ...*hybrid.Store) (*Client, erro
 
 	// Start background reaper
 	go cm.reaper()
+	// Warm configured idle pools immediately rather than waiting for the
+	// first reaper tick.
+	go cm.warmIdlePools()
 	return cm, nil
 }
 
@@ -892,7 +895,8 @@ func (c *Client) createConnection(ctx context.Context, provider config.UsenetPro
 	return conn, nil
 }
 
-// reaper periodically closes idle connections
+// reaper periodically closes idle connections and tops up each provider's
+// idle pool toward its configured MinIdleConnections floor.
 func (c *Client) reaper() {
 	ticker := time.NewTicker(timeouts.ReaperInterval)
 	defer ticker.Stop()
@@ -902,6 +906,53 @@ func (c *Client) reaper() {
 			return
 		}
 		c.reapIdleConnections()
+		c.warmIdlePools()
+	}
+}
+
+// warmIdlePools opportunistically dials and pools new idle connections for
+// any provider configured with MinIdleConnections > 0, so the first request
+// of a session (or any request after the pool has gone fully idle) finds an
+// already-dialed connection instead of paying a fresh TCP+TLS+AUTH handshake
+// before a single byte can be requested. Default MinIdleConnections is 0
+// (off), matching the prior purely-reactive behavior.
+func (c *Client) warmIdlePools() {
+	for _, pp := range c.pools {
+		c.warmProviderPool(pp)
+	}
+}
+
+func (c *Client) warmProviderPool(pp *ProviderPool) {
+	if pp.config.MinIdleConnections <= 0 {
+		return
+	}
+	for {
+		if c.closed.Load() {
+			return
+		}
+		pp.mu.Lock()
+		idle := len(pp.conns)
+		pp.mu.Unlock()
+		if idle >= pp.config.MinIdleConnections {
+			return
+		}
+
+		// Best-effort, non-blocking slot acquire: warming must never compete
+		// with real traffic for a busy pool. If the pool is fully checked
+		// out right now, just try again on the next reaper tick.
+		select {
+		case pp.slots <- struct{}{}:
+		default:
+			return
+		}
+
+		conn, err := c.createConnection(context.Background(), pp.config)
+		if err != nil {
+			<-pp.slots
+			c.logger.Debug().Err(err).Str("host", pp.config.Host).Msg("Pool warmup: failed to dial idle connection")
+			return
+		}
+		c.put(conn, pp.config)
 	}
 }
 
