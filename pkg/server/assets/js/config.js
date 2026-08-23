@@ -1255,6 +1255,8 @@ class ConfigManager {
             const maxConnectionsInput = getField('max_connections');
             const priorityInput = getField('priority');
             const backupInput = getField('backup');
+            const subscriptionExpiryInput = getField('subscription_expiry');
+            const autoRenewInput = getField('auto_renew');
 
             if (!hostInput || !portInput || !usernameInput || !passwordInput || !backboneInput || !sslInput || !maxConnectionsInput || !priorityInput) {
                 return;
@@ -1272,7 +1274,10 @@ class ConfigManager {
                 // Backup is optional and defaults false — old form versions
                 // (or missing inputs after a hot-reload) shouldn't accidentally
                 // turn a primary into a backup.
-                backup: backupInput ? backupInput.checked : false
+                backup: backupInput ? backupInput.checked : false,
+                // Informational only - subscription tracking shown on Stats.
+                subscription_expiry: subscriptionExpiryInput ? subscriptionExpiryInput.value.trim() : '',
+                auto_renew: autoRenewInput ? autoRenewInput.checked : false
             };
 
             if (provider.host && provider.username && provider.password) {
@@ -1958,6 +1963,15 @@ class ConfigManager {
                                id="usenet_provider_${index}_priority">
                         <span class="text-sm opacity-70">Priority for this provider (lower number = higher priority)</span>
                     </div>
+                    <div>
+                        <label class="label" for="usenet_provider_${index}_subscription_expiry">
+                            <span class="font-medium">Subscription End Date</span>
+                        </label>
+                        <input type="date" class="input w-full"
+                               name="usenet.providers[${index}].subscription_expiry"
+                               id="usenet_provider_${index}_subscription_expiry">
+                        <span class="text-sm opacity-70">Optional - shown on the Stats page so you can track renewals</span>
+                    </div>
                 </div>
 
                 <div class="flex flex-wrap gap-4 mt-4">
@@ -1973,6 +1987,13 @@ class ConfigManager {
                                name="usenet.providers[${index}].backup"
                                id="usenet_provider_${index}_backup">
                         <span class="text-sm">Backup provider (fallback only)</span>
+                    </label>
+                    <label class="flex items-center gap-2 cursor-pointer"
+                           title="Informational only - does not affect connections or billing. Shown next to the subscription end date on the Stats page.">
+                        <input type="checkbox" class="checkbox checkbox-sm"
+                               name="usenet.providers[${index}].auto_renew"
+                               id="usenet_provider_${index}_auto_renew">
+                        <span class="text-sm">Auto-renews</span>
                     </label>
                 </div>
             </div>
