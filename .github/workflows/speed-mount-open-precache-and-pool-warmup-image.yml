@@ -28,5 +28,5 @@ jobs:
           push: true
           tags: ghcr.io/zab1996/cli_mount:speed-mount-open-precache-and-pool-warmup
           build-args: |
-            VERSION=2.4.8
+            VERSION=2.4.9
             CHANNEL=speed-mount-open-precache-and-pool-warmup
