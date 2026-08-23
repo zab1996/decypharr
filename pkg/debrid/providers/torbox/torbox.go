@@ -401,7 +401,10 @@ func (tb *Torbox) loadDownloadPresent() error {
 	total := 0
 	for {
 		var res TorrentsListResponse
-		resp, err := tb.doGet("/api/torrents/mylist", map[string]string{"offset": fmt.Sprintf("%d", offset)}, &res)
+		resp, err := tb.doGet("/api/torrents/mylist", map[string]string{
+			"bypass_cache": "true",
+			"offset":       fmt.Sprintf("%d", offset),
+		}, &res)
 		if err != nil {
 			return err
 		}
@@ -581,7 +584,10 @@ func (tb *Torbox) GetTorrents() ([]*types.Torrent, error) {
 func (tb *Torbox) getTorrents(offset int) ([]*types.Torrent, error) {
 	var res TorrentsListResponse
 
-	resp, err := tb.doGet("/api/torrents/mylist", map[string]string{"offset": fmt.Sprintf("%d", offset)}, &res)
+	resp, err := tb.doGet("/api/torrents/mylist", map[string]string{
+		"bypass_cache": "true",
+		"offset":       fmt.Sprintf("%d", offset),
+	}, &res)
 	if err != nil {
 		return nil, err
 	}

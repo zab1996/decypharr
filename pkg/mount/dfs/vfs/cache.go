@@ -347,36 +347,50 @@ func (c *Cache) evictCandidates(now time.Time, candidates []candidateEntry, tota
 
 	removed := make(map[string]struct{})
 	removalErrors := 0
-	removeCandidate := func(candidate candidateEntry) {
+	// removeCandidate returns whether removal fully succeeded. Callers must
+	// only deduct cachedSize from totalSize on success — a failed os.Remove
+	// (permissions, file busy, etc.) means the bytes are still on disk, and
+	// deducting anyway makes the cache believe it freed space it didn't,
+	// letting it silently under-evict over time. Mirrors purgeCandidates'
+	// hadError-gated accounting below.
+	removeCandidate := func(candidate candidateEntry) bool {
 		if _, skip := removed[candidate.key]; skip {
-			return
+			return true
 		}
 		// Never remove items that are in the map or have open handles
 		if candidate.inMap || candidate.opens > 0 {
-			return
+			return false
 		}
+		hadError := false
 		// Remove only the specific data + meta files, not the entire entry directory
 		if candidate.dataPath != "" {
 			if err := os.Remove(candidate.dataPath); err != nil && !os.IsNotExist(err) {
 				c.logger.Warn().Err(err).Str("path", candidate.dataPath).Msg("failed to remove cache data file")
 				removalErrors++
+				hadError = true
 			}
 		}
 		if candidate.metaPath != "" {
 			if err := os.Remove(candidate.metaPath); err != nil && !os.IsNotExist(err) {
 				c.logger.Warn().Err(err).Str("path", candidate.metaPath).Msg("failed to remove cache meta file")
 				removalErrors++
+				hadError = true
 			}
 		}
+		if hadError {
+			return false
+		}
 		removed[candidate.key] = struct{}{}
+		return true
 	}
 
 	// Phase 1: Remove expired entries (only if not in map)
 	if c.config.CacheExpiry > 0 {
 		for _, candidate := range candidates {
 			if !candidate.inMap && candidate.opens == 0 && now.Sub(candidate.atime) > c.config.CacheExpiry {
-				removeCandidate(candidate)
-				totalSize -= candidate.cachedSize
+				if removeCandidate(candidate) {
+					totalSize -= candidate.cachedSize
+				}
 			}
 		}
 	}
@@ -401,11 +415,15 @@ func (c *Cache) evictCandidates(now time.Time, candidates []candidateEntry, tota
 			if _, skip := removed[candidate.key]; skip {
 				continue
 			}
-			removeCandidate(candidate)
-			totalSize -= candidate.cachedSize
+			if removeCandidate(candidate) {
+				totalSize -= candidate.cachedSize
+			}
 		}
 	}
 
+	if totalSize < 0 {
+		totalSize = 0
+	}
 	return totalSize, len(removed), removalErrors, removed
 }
 
@@ -1037,6 +1055,14 @@ func (item *CacheItem) flushMetadata(force bool) {
 	if !force && !item.metaDirty.Load() {
 		return
 	}
+	// Clear dirty BEFORE snapshotting item.info, not after the write
+	// succeeds. A markMetadataDirty() call landing between the snapshot and
+	// a trailing Store(false) would otherwise be silently erased — that
+	// mutation is already reflected in nothing on disk, but the flag says
+	// clean, so it may never get flushed. Clearing first means any such
+	// call re-arms dirty and gets picked up by the next tick instead.
+	item.metaDirty.Store(false)
+
 	item.metaMu.RLock()
 	info := item.info
 	if len(info.Rs) > 0 {
@@ -1049,11 +1075,13 @@ func (item *CacheItem) flushMetadata(force bool) {
 	data, err := json.Marshal(info)
 	if err != nil {
 		item.cache.logger.Warn().Err(err).Str("key", item.key).Msg("failed to marshal cache metadata")
+		item.metaDirty.Store(true)
 		return
 	}
 	// Confirm directory exists before writing metadata (in case it was deleted by cleanup)
 	if err := os.MkdirAll(filepath.Dir(item.metaPath), 0755); err != nil {
 		item.cache.logger.Warn().Err(err).Str("key", item.key).Msg("failed to create cache directory for metadata")
+		item.metaDirty.Store(true)
 		return
 	}
 	// Atomic write: write to temp file then rename to avoid corrupt reads
@@ -1061,14 +1089,15 @@ func (item *CacheItem) flushMetadata(force bool) {
 	tmpPath := item.metaPath + ".tmp"
 	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
 		item.cache.logger.Warn().Err(err).Str("key", item.key).Msg("failed to write cache metadata")
+		item.metaDirty.Store(true)
 		return
 	}
 	if err := os.Rename(tmpPath, item.metaPath); err != nil {
 		item.cache.logger.Warn().Err(err).Str("key", item.key).Msg("failed to rename cache metadata")
 		_ = os.Remove(tmpPath)
+		item.metaDirty.Store(true)
 		return
 	}
-	item.metaDirty.Store(false)
 }
 
 // ItemInfo is persisted to disk

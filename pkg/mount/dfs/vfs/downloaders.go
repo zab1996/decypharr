@@ -58,6 +58,20 @@ const (
 	minSuccessfulChunksBeforeGrowth = 2
 )
 
+// maxStoppingWaitNanos bounds how long DownloadWithPriority waits for an
+// in-progress StopAll() teardown to resume before giving up. A normal cycle
+// finishes in well under this (StopAll waits on in-flight downloaders and the
+// kicker, then reinstalls a fresh ctx) — this exists purely as a safety net
+// so a stuck stopping=true state from a bug elsewhere degrades to a clear
+// error instead of hanging a caller that passed a context with no deadline
+// of its own. A var (not a const) so tests can shrink it, matching
+// releaseStopGracePeriodNanos in cache.go.
+var maxStoppingWaitNanos atomic.Int64
+
+func init() {
+	maxStoppingWaitNanos.Store(int64(30 * time.Second))
+}
+
 // Downloaders coordinates multiple concurrent downloads to a cache item
 type Downloaders struct {
 	parentCtx     context.Context
@@ -79,6 +93,12 @@ type Downloaders struct {
 	// It blocks the idle-restart path from spinning up a fresh kicker before
 	// the previous one has fully exited and the new ctx is installed.
 	stopping bool
+	// stopCond wakes DownloadWithPriority's stopping-wait once StopAll()
+	// finishes a teardown/resume cycle (stopping -> false) or Close()
+	// permanently ends the session (closed -> true). Locked on mu; created
+	// once in NewDownloaders since a Downloaders is reused across sessions,
+	// not reallocated per StopAll cycle.
+	stopCond *sync.Cond
 	// idle is true when all downloaders have stopped. Guarded by mu so that
 	// the restart decision in Download() and the teardown in StopAll() are
 	// serialized with kicker lifecycle changes.
@@ -243,6 +263,7 @@ func NewDownloaders(ctx context.Context, mgr *manager.Manager, item *CacheItem, 
 		// streamID is populated lazily when the first read occurs.
 		streamID: "",
 	}
+	dls.stopCond = sync.NewCond(&dls.mu)
 	dls.touchActivity() // Initialize activity timestamp
 
 	// Background kicker to handle stalled waiters and idle detection
@@ -279,11 +300,59 @@ func (dls *Downloaders) DownloadWithPriority(ctx context.Context, r ranges.Range
 		return errors.New("downloaders closed")
 	}
 
-	// Reject new work while StopAll() is tearing down the current session so
-	// we don't race a new stream/downloader against the teardown path.
+	// Wait out an in-progress StopAll() teardown instead of failing
+	// immediately. StopAll is designed to resume — it resets the error
+	// budget and circuit breaker and clears stopping once the new ctx is
+	// installed (see StopAll) — so a request that merely lands during the
+	// teardown window has nothing wrong with it. Failing it immediately used
+	// to mean a downloader spawned on the old, already-canceled ctx exited
+	// instantly and failed every pending waiter with a spurious read error,
+	// even though a fresh session was seconds away. This fires routinely,
+	// not just at shutdown: StopAll runs after every item.Release() grace
+	// period, not only on process exit.
 	if dls.stopping {
-		dls.mu.Unlock()
-		return errors.New("downloaders stopping")
+		// waitCtx bounds the wait independently of the caller's own ctx — a
+		// caller with no deadline of its own (context.Background()) must
+		// still not hang forever if stopping never clears due to a bug
+		// elsewhere in this file's teardown/resume path.
+		maxWait := time.Duration(maxStoppingWaitNanos.Load())
+		waitCtx, cancelWait := context.WithTimeout(ctx, maxWait)
+		stopWaiting := context.AfterFunc(waitCtx, func() {
+			dls.mu.Lock()
+			dls.stopCond.Broadcast()
+			dls.mu.Unlock()
+		})
+		// waitCtx.Err() must be part of the loop condition, not just checked
+		// after: the AfterFunc broadcasts once when waitCtx becomes Done, but
+		// if stopping is still true at that point (the safety-net timeout
+		// firing, or the caller's own ctx being canceled) the broadcast alone
+		// doesn't stop the loop — without this check it would just re-enter
+		// Wait() and block forever, since nothing broadcasts a second time.
+		for dls.stopping && !dls.closed && waitCtx.Err() == nil {
+			dls.stopCond.Wait()
+		}
+		stopWaiting()
+		// Capture the wait error before canceling waitCtx ourselves below —
+		// cancelWait() unconditionally marks it Canceled, which would
+		// otherwise make even the successful (stopping cleared normally)
+		// path look like it had timed out.
+		waitErr := waitCtx.Err()
+		cancelWait()
+		if dls.closed {
+			dls.mu.Unlock()
+			return errors.New("downloaders closed")
+		}
+		if waitErr != nil {
+			dls.mu.Unlock()
+			if ctx.Err() == nil {
+				// Only our internal safety timeout fired; the caller's own
+				// ctx is still fine. Surface a clear, specific error instead
+				// of a bare "deadline exceeded" that looks like the caller's
+				// own timeout tripped.
+				return fmt.Errorf("timed out after %s waiting for downloaders to resume from stopping: %w", maxWait, waitErr)
+			}
+			return ctx.Err()
+		}
 	}
 
 	if err := dls.ctx.Err(); err != nil {
@@ -682,7 +751,20 @@ func (dls *Downloaders) Close(inErr error) error {
 		return nil
 	}
 	dls.closed = true
+	// Wake any DownloadWithPriority call still waiting out a stopping
+	// window — Close means this session is never resuming, so waiters must
+	// see closed=true and return the terminal error instead of blocking on
+	// a stopping->false transition that will now never come.
+	dls.stopCond.Broadcast()
 	dls.untrackStreamLocked()
+	// An item can be torn down (idle-timeout eviction, a forced close, or
+	// process shutdown) while its circuit breaker happens to be open.
+	// StopAll and checkIdleTimeout both release the cache-wide
+	// circuitBreakers gauge slot on their way out; Close is the third path
+	// that can end a Downloaders' life and needs the same release, or the
+	// gauge leaks permanently for any item that never went through the
+	// other two.
+	dls.resetCircuitLocked()
 
 	// Copy slice before unlocking to avoid races while waiting.
 	dlsCopy := make([]*downloader, len(dls.dls))
@@ -745,10 +827,18 @@ func (dls *Downloaders) isCircuitOpen() bool {
 		dls.mu.Lock()
 		openedAt = dls.circuitOpenAt.Load()
 		if openedAt != 0 && time.Now().UnixNano()-openedAt >= int64(circuitCooldownDuration) {
-			dls.circuitOpen.Store(false)
-			dls.circuitOpenAt.Store(0)
+			// Errors from before the cooldown must not carry over — that
+			// would immediately re-trip the breaker on the next error
+			// instead of giving the connection a clean slate. Matches the
+			// same errorCount/lastErr + resetCircuitLocked reset used by
+			// checkIdleTimeout and StopAll. resetCircuitLocked also
+			// decrements the cache-wide circuitBreakers gauge; the inline
+			// Store(false) here previously skipped that, leaking the gauge
+			// by one every time a breaker expired via this path instead of
+			// going idle first.
 			dls.errorCount = 0
 			dls.lastErr = nil
+			dls.resetCircuitLocked()
 		}
 		dls.mu.Unlock()
 		return false
@@ -889,6 +979,9 @@ func (dls *Downloaders) StopAll() {
 		dls.resetCircuitLocked()
 	}
 	dls.stopping = false
+	// Wake every DownloadWithPriority call waiting out this teardown — the
+	// new ctx (or, if Close raced us, closed=true) is now visible under mu.
+	dls.stopCond.Broadcast()
 	dls.mu.Unlock()
 }
 

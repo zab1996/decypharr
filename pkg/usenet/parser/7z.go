@@ -220,10 +220,7 @@ func (p *SevenZParser) processRARFilesFromPositions(
 		rarFile := rarFiles[volIndex]
 
 		// Optimization: RAR headers are small - 64KB is usually enough
-		headerSize := int64(64 * 1024)
-		if headerSize > int64(rarFile.Size) {
-			headerSize = int64(rarFile.Size)
-		}
+		headerSize := min(int64(64*1024), int64(rarFile.Size))
 
 		headerData := make([]byte, headerSize)
 		n, err := readerAt.ReadAt(headerData, rarFile.Offset)
@@ -345,6 +342,7 @@ func (p *SevenZParser) buildSegmentsForRARFile(
 	}
 
 	var fileSegments []storage.NZBSegment
+	var currentFileOffset int64 // Offset within the final extracted file
 
 	// Parse each volume part of this file
 	for partIdx, part := range rarEntry.VolumeParts {
@@ -387,7 +385,13 @@ func (p *SevenZParser) buildSegmentsForRARFile(
 			continue
 		}
 
-		// Append this part's segments to the file's segment list
+		// Assign output-file positions cumulatively across parts (same
+		// pattern as RARParser.buildSegmentsForFile), then append.
+		for i := range partSegments {
+			partSegments[i].StartOffset = currentFileOffset
+			partSegments[i].EndOffset = currentFileOffset + partSegments[i].Bytes - 1
+			currentFileOffset += partSegments[i].Bytes
+		}
 		fileSegments = append(fileSegments, partSegments...)
 	}
 
@@ -462,28 +466,24 @@ func sliceSegmentsForRange(
 			}
 
 			// Calculate overlap
-			overlapStart := segAbsStart
-			if overlapStart < targetStart {
-				overlapStart = targetStart
-			}
+			overlapStart := max(segAbsStart, targetStart)
 
-			overlapEnd := segAbsEnd
-			if overlapEnd > targetEnd {
-				overlapEnd = targetEnd
-			}
+			overlapEnd := min(segAbsEnd, targetEnd)
 
-			// Calculate segment-relative offsets
+			// relStart = where to start reading within this NNTP segment's
+			// decoded data (goes in SegmentDataStart, matching the other
+			// slicers — sliceSegmentsForRangeSimple and
+			// buildSegmentsForVolumePart). StartOffset/EndOffset are output-
+			// file positions and are assigned by the caller once all parts of
+			// the file have been collected.
 			relStart := overlapStart - segAbsStart
-			relEnd := overlapEnd - segAbsStart
 
-			// Create sliced segment
 			slicedSeg := storage.NZBSegment{
-				Number:      seg.Number,
-				MessageID:   seg.MessageID,
-				Bytes:       relEnd - relStart + 1,
-				StartOffset: relStart,
-				EndOffset:   relEnd,
-				Group:       seg.Group,
+				Number:           seg.Number,
+				MessageID:        seg.MessageID,
+				Bytes:            overlapEnd - overlapStart + 1,
+				SegmentDataStart: relStart,
+				Group:            seg.Group,
 			}
 
 			result = append(result, slicedSeg)

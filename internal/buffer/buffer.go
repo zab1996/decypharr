@@ -16,13 +16,18 @@
 //   - Sparse disk file pre-truncated to Config.TotalSize (when known) so
 //     WriteAt at any offset within the logical range is valid without
 //     growing the file lazily.
-//   - Async flush worker pool. WriteAt returns when data is in RAM; the
-//     flusher persists to disk in the background. Eviction blocks only if
-//     it needs to wait for a still-dirty block.
+//   - WriteAt returns as soon as the data is in RAM; a block's dirty bytes are
+//     persisted to disk lazily — when the block is evicted to make room, and on
+//     Sync/Close. There is no background flush worker: the flush runs under the
+//     buffer's exclusive lock (see flushBlockLocked for why it must), so
+//     evicting a still-dirty block briefly serializes against readers. For the
+//     write-once streaming workload this is rare in practice — blocks are
+//     usually clean (re-read, never rewritten) by the time they reach the LRU
+//     tail.
 //   - Discard releases bytes from RAM AND from disk via fallocate(PUNCH_HOLE)
 //     on Linux. On tmpfs this directly returns RAM to the kernel.
 //
-// Range tracker
+// # Range tracker
 //
 // A rangeSet maintains the set of byte ranges that are present anywhere
 // (RAM or disk). ReadAt consults this first: any byte in the requested
@@ -93,7 +98,9 @@ type Stats struct {
 type Config struct {
 	// MemorySize is the maximum bytes held in RAM across all blocks. When
 	// allocating a new block would exceed this, the LRU evictor flushes
-	// and reclaims the oldest clean block. Default 64 MB when zero.
+	// and reclaims the oldest clean block. Default 32 MB when zero; values
+	// below one block (1 MB) are clamped up to it, since the cache is
+	// block-granular and a smaller ceiling could never admit a block.
 	MemorySize int64
 
 	// DiskPath is the file path for the sparse disk-backing file. If
@@ -142,12 +149,9 @@ type Buffer struct {
 	// mu guards blocks, the LRU list, bytesInRAM, and ranges. Reads
 	// (ReadAt, HasRange, Present, Stats) take RLock so multiple readers
 	// can hit RAM-cached blocks or pread from disk in parallel. Writers
-	// (WriteAt cache path, Discard, eviction) take Lock.
-	//
-	// The write-through publish path is the one carved-out exception: it
-	// holds mu.RLock (shared — does not stall concurrent readers) while
-	// inserting into ranges, since RLock still excludes the exclusive
-	// Lock that block creation would need. See writeRegion.
+	// (WriteAt cache path, the write-through publish step, Discard,
+	// eviction) take Lock; write-through keeps only the pwrite itself
+	// outside the lock. See writeRegion.
 	//
 	// Caller contract: do not WriteAt/Discard and ReadAt the same byte
 	// range concurrently. Both call sites (Usenet SegmentCache, DFS
@@ -168,12 +172,11 @@ type Buffer struct {
 	// the fast path adds nothing more than one atomic.Load per block.
 	states []atomic.Uint32
 
-	// readHead is the caller's current read position (see SetReadHead). It
-	// serves two roles: blocks with offset < readHead are evictable from RAM
-	// while blocks with offset >= readHead are protected (the active window
-	// the reader still cares about); and it is the frontier the owning Pool's
-	// disk backstop punches behind (it reclaims [0, readHead-BackWindow)).
-	// Zero means "no hint": pure LRU for RAM, no disk punching.
+	// readHead is the caller's current read position (see SetReadHead). It is
+	// the frontier the owning Pool's disk backstop punches behind (it reclaims
+	// [0, readHead-BackWindow)). RAM eviction does not consult it — the block
+	// cache is pure write-order LRU, which for the streaming workload already
+	// keeps the active window resident. Zero means "no hint": no disk punching.
 	readHead atomic.Int64
 
 	// diskBytes is this Buffer's running total of on-disk present bytes,
@@ -216,6 +219,11 @@ type Buffer struct {
 func newBuffer(p *Pool, cfg Config) (*Buffer, error) {
 	if cfg.MemorySize <= 0 {
 		cfg.MemorySize = defaultMemorySize
+	}
+	if cfg.MemorySize < blockSize {
+		// Block-granular cache: a ceiling below one block would make the
+		// first allocation unsatisfiable.
+		cfg.MemorySize = blockSize
 	}
 	if cfg.TotalSize < 0 {
 		return nil, ErrOutOfRange
@@ -267,10 +275,7 @@ func newBuffer(p *Pool, cfg Config) (*Buffer, error) {
 	}
 	// Size the reuse free list to the working set, capped — a Buffer never
 	// needs to retain more idle blocks than it can hold resident.
-	b.alloc.maxFree = int(b.maxBytes / blockSize)
-	if b.alloc.maxFree > maxReuseBlocks {
-		b.alloc.maxFree = maxReuseBlocks
-	}
+	b.alloc.maxFree = min(int(b.maxBytes/blockSize), maxReuseBlocks)
 	if b.alloc.maxFree < 1 {
 		b.alloc.maxFree = 1
 	}
@@ -358,6 +363,15 @@ func (b *Buffer) writeRegion(blockOff int64, lo, hi int, src []byte) error {
 	// may be stale (acquireBlockLocked returns the existing block if so).
 	if resident || canCache {
 		b.mu.Lock()
+		// Re-check under the lock: a WriteAt past the entry closed-check that
+		// loses the race with Close must not allocate blocks or publish
+		// ranges — the pool RAM/disk accounting Close just settled would
+		// drift permanently (this Buffer is already unregistered, so nothing
+		// would ever subtract the additions back out).
+		if b.closed.Load() {
+			b.mu.Unlock()
+			return ErrClosed
+		}
 		blk, ok := b.blocks[blockOff]
 		if !ok {
 			var err error
@@ -381,6 +395,12 @@ func (b *Buffer) writeRegion(blockOff int64, lo, hi int, src []byte) error {
 	b.statsWriteThrough.Add(1)
 
 	b.mu.Lock()
+	// Same closed re-check as the cached path: never publish into the range
+	// tracker after Close has settled the disk accounting.
+	if b.closed.Load() {
+		b.mu.Unlock()
+		return ErrClosed
+	}
 	// Rare edge: the cache gained room (e.g. a Discard freed a block) and
 	// another writer cached this block while our pwrite was in flight.
 	// Mirror our bytes into RAM so the resident block stays authoritative.
@@ -397,19 +417,10 @@ func (b *Buffer) writeRegion(blockOff int64, lo, hi int, src []byte) error {
 	return err
 }
 
-// writeIntoBlockLocked copies src into a RAM-resident block's [lo, hi)
-// range, flushing first if the new write isn't contiguous with the
-// existing dirty range, then records presence. Caller holds b.mu.
+// writeIntoBlockLocked copies src into a RAM-resident block's [lo, hi),
+// records its exact dirty range, then records presence. Caller holds b.mu.
 func (b *Buffer) writeIntoBlockLocked(blk *block, lo, hi int, src []byte) error {
-	// If this write isn't contiguous with the existing dirty range, we
-	// must flush what's there before extending; otherwise the next flush
-	// would persist arbitrary block contents between the two.
-	if !blk.addDirty(lo, hi) {
-		if err := b.flushBlockLocked(blk); err != nil {
-			return err
-		}
-		blk.addDirty(lo, hi)
-	}
+	blk.addDirty(lo, hi)
 	copy(blk.data[lo:hi], src)
 	b.touchLocked(blk)
 	b.rangesInsert(blk.off+int64(lo), int64(hi-lo))
@@ -450,6 +461,16 @@ func (b *Buffer) ReadAt(p []byte, off int64) (int, error) {
 	// does: a range being read isn't being concurrently written or
 	// Discarded. Under that contract no in-flight state transition can
 	// invalidate the snapshot we just took.
+	//
+	// One concurrent Discarder is NOT the caller: the pool's disk backstop
+	// (punchBehindWindow) punches everything below readHead-BackWindow on its
+	// own goroutine. Because this path preads after the lock-free state load
+	// with no re-validation, a punch landing between the two would read back a
+	// hole as zeros. The invariant that prevents it is the readHead contract:
+	// callers MUST publish a read head that covers off (SetReadHead(off) or
+	// lower) BEFORE issuing the read, so the backstop's ceiling sits at or
+	// below off-BackWindow and never reaches the range in flight. DFS's
+	// ReadAtContext does this before both the download and the read.
 	if b.states != nil {
 		allFast := true
 		for cur := off; cur < end; cur = alignDown(cur) + blockSize {
@@ -463,6 +484,13 @@ func (b *Buffer) ReadAt(p []byte, off int64) (int, error) {
 			n, err := b.file.ReadAt(p, off)
 			if err != nil && !errors.Is(err, io.EOF) {
 				return n, fmt.Errorf("buffer: disk read at %d: %w", off, err)
+			}
+			if n < len(p) {
+				// The state slots said this range is fully on disk; a short
+				// pread of a present range means an invariant broke (file
+				// shorter than the tracked presence). Surface it rather than
+				// silently handing back stale caller memory in p's tail.
+				return n, io.ErrUnexpectedEOF
 			}
 			b.statsMisses.Add(1)
 			return n, nil
@@ -500,9 +528,16 @@ func (b *Buffer) ReadAt(p []byte, off int64) (int, error) {
 			// Disk read. pread is thread-safe; a concurrent write-through
 			// pwrite to a *different* range is fine, and the caller
 			// contract forbids a concurrent write/discard of *this* range.
-			if _, err := b.file.ReadAt(p[dstLo:dstHi], cur); err != nil && !errors.Is(err, io.EOF) {
+			n, err := b.file.ReadAt(p[dstLo:dstHi], cur)
+			if err != nil && !errors.Is(err, io.EOF) {
 				b.mu.RUnlock()
 				return dstLo, fmt.Errorf("buffer: disk read at %d: %w", cur, err)
+			}
+			if n < dstHi-dstLo {
+				// Present per the range tracker but the file came up short:
+				// an invariant broke. Don't claim bytes we never read.
+				b.mu.RUnlock()
+				return dstLo + n, io.ErrUnexpectedEOF
 			}
 			diskServed = true
 		}
@@ -553,6 +588,16 @@ func (b *Buffer) discard(off, length int64) int64 {
 	end := off + length
 
 	b.mu.Lock()
+	// Re-check under the lock: the pool's punch backstop passes Discard's
+	// entry check on its own goroutine and can lose the race with Close.
+	// Close settles this Buffer's disk footprint against the pool exactly
+	// once (diskBytes.Swap); a discard slipping in afterwards would subtract
+	// the same bytes a second time and leave pool.diskInUse under-counted
+	// forever — silently disabling the DiskLimit backstop.
+	if b.closed.Load() {
+		b.mu.Unlock()
+		return 0
+	}
 	for blkOff := alignDown(off); blkOff < end; blkOff += blockSize {
 		blk, ok := b.blocks[blkOff]
 		if !ok {
@@ -565,24 +610,11 @@ func (b *Buffer) discard(off, length int64) int64 {
 			b.dropBlockLocked(blk)
 			continue
 		}
-		// Partial discard within a block: trim the block's dirty range
-		// down to the surviving portion so we don't try to flush bytes
-		// the caller just said it doesn't care about.
-		if blk.dirtyLo >= 0 {
-			startInBlk := int(max(off-blkOff, 0))
-			endInBlk := int(min(end-blkOff, blockSize))
-			// Clip [dirtyLo, dirtyHi) by removing [startInBlk, endInBlk).
-			if startInBlk <= blk.dirtyLo && endInBlk >= blk.dirtyHi {
-				blk.clearDirty()
-			} else if startInBlk <= blk.dirtyLo && endInBlk > blk.dirtyLo {
-				blk.dirtyLo = endInBlk
-			} else if endInBlk >= blk.dirtyHi && startInBlk < blk.dirtyHi {
-				blk.dirtyHi = startInBlk
-			}
-			if blk.dirtyHi <= blk.dirtyLo {
-				blk.clearDirty()
-			}
-		}
+		// Partial discard within a block: trim every dirty extent so we
+		// don't later flush bytes the caller explicitly discarded.
+		startInBlk := int(max(off-blkOff, 0))
+		endInBlk := int(min(end-blkOff, blockSize))
+		blk.removeDirty(startInBlk, endInBlk)
 	}
 	removed := b.rangesRemove(off, length)
 	// Recompute fast-path state for every block this discard touched —
@@ -741,7 +773,9 @@ func (b *Buffer) Sync() error {
 		return ErrClosed
 	}
 	b.mu.Lock()
-	// Collect dirty blocks without holding the lock during disk writes.
+	// Flush every dirty block under the exclusive lock — flushBlockLocked
+	// requires it (releasing mu around the pwrite risks a torn write; see
+	// its doc comment).
 	var dirty []*block
 	for _, blk := range b.blocks {
 		if !blk.isClean() {
@@ -793,6 +827,10 @@ func (b *Buffer) Close() error {
 	if db := b.diskBytes.Swap(0); db > 0 {
 		b.pool.subDisk(db)
 	}
+	// Empty the range tracker so a racing discard/publish that somehow
+	// reaches it (belt and suspenders on top of the closed re-checks) finds
+	// nothing to remove and cannot perturb the pool accounting again.
+	b.ranges = newRangeSet()
 	b.mu.Unlock()
 	b.pool.remove(b)
 
@@ -815,16 +853,24 @@ func (b *Buffer) Close() error {
 	return closeErr
 }
 
-// SetReadHead publishes the caller's current read position. Blocks with
-// offset < off become freely evictable from RAM; blocks with offset >= off are
-// the active window and are preserved when possible. It is also the frontier
+// SetReadHead publishes the caller's current read position. It is the frontier
 // the owning Pool's disk backstop punches behind: under DiskLimit pressure the
-// pool reclaims [0, off-BackWindow). Pass 0 to clear (pure LRU, no disk
-// punching). Cheap, atomic, no lock.
+// pool reclaims [0, off-BackWindow). RAM eviction is unaffected — the block
+// cache is pure write-order LRU. Pass 0 to clear (no disk punching). Cheap,
+// atomic, no lock.
 //
 // Driven from the streaming cursor: usenet's SegmentCache.MarkConsumed and
 // DFS's ReadAtContext both call this as playback advances, so eviction never
 // fights the data the reader is about to ask for.
+//
+// Contract for backstop safety (DiskLimit > 0): publish a read head that
+// covers the offset you are about to read BEFORE issuing that read. The disk
+// backstop punches everything below readHead-BackWindow, and the lock-free
+// fast read path does not re-validate after its state load — so a read whose
+// offset sits below the current readHead-BackWindow can race a punch and read
+// a hole back as zeros. Calling SetReadHead(off) first pulls the protected
+// frontier over the in-flight read and closes that window (notably on a
+// seek-back, where off is below the prior forward read head).
 func (b *Buffer) SetReadHead(off int64) {
 	if off < 0 {
 		off = 0
@@ -835,26 +881,6 @@ func (b *Buffer) SetReadHead(off int64) {
 	// instead of letting the disk backstop punch right behind a seek.
 	b.readHead.Store(off)
 }
-
-// tryEvictCleanLocked drops the LRU-tail clean block, respecting the
-// caller-supplied eviction-min-offset hint when set. Returns true if a
-// block was evicted. Caller holds b.mu.
-func (b *Buffer) tryEvictCleanLocked() bool {
-	minOff := b.readHead.Load()
-	for blk := b.lruTail; blk != nil; blk = blk.prev {
-		if !blk.isClean() {
-			continue
-		}
-		if minOff > 0 && blk.off >= minOff {
-			continue // block is in the protected active window
-		}
-		b.dropBlockLocked(blk)
-		b.statsEvictions.Add(1)
-		return true
-	}
-	return false
-}
-
 
 // Stats returns the current observability counters.
 func (b *Buffer) Stats() Stats {
@@ -898,14 +924,22 @@ func (b *Buffer) acquireBlockLocked(blockOff int64) (*block, error) {
 	// and the pool budget. A failure to evict is only fatal when we're over
 	// the per-stream ceiling; if it's purely pool pressure and this Buffer
 	// has nothing left to evict, allocate anyway (bounded overshoot — one block
-	// per actively-allocating Buffer).
+	// per actively-allocating Buffer). Breaking on no-progress (not just on
+	// error) is load-bearing: evictOneLocked with an empty LRU evicts nothing
+	// and returns no error, and retrying it while the pool stays over budget
+	// would spin forever under the exclusive lock.
 	for b.bytesInRAM+blockSize > b.maxBytes || b.pool.wouldExceedMemory() {
-		if err := b.evictOneLocked(); err != nil {
-			if b.bytesInRAM+blockSize > b.maxBytes {
-				return nil, err
-			}
-			break
+		evicted, err := b.evictOneLocked()
+		if evicted {
+			continue
 		}
+		if b.bytesInRAM+blockSize > b.maxBytes {
+			if err == nil {
+				err = fmt.Errorf("buffer: no evictable blocks under memory ceiling")
+			}
+			return nil, err
+		}
+		break
 	}
 
 	bufPtr := b.alloc.get()
@@ -920,12 +954,11 @@ func (b *Buffer) acquireBlockLocked(blockOff int64) (*block, error) {
 	}
 
 	blk := &block{
-		off:     blockOff,
-		data:    buf,
-		bufPtr:  bufPtr,
-		dirtyLo: -1,
-		dirtyHi: -1,
+		off:    blockOff,
+		data:   buf,
+		bufPtr: bufPtr,
 	}
+	blk.initDirty()
 	b.blocks[blockOff] = blk
 	b.bytesInRAM += int64(blockSize)
 	b.pool.addBlock()
@@ -954,28 +987,28 @@ func (b *Buffer) dropBlockLocked(blk *block) {
 }
 
 // evictOneLocked drops the LRU clean block (flushing the oldest dirty
-// block first if all candidates are dirty). Caller holds b.mu.
-func (b *Buffer) evictOneLocked() error {
+// block first if all candidates are dirty). Returns whether a block was
+// actually evicted — (false, nil) means there was nothing to evict, and the
+// caller must not retry, or it would spin forever. Caller holds b.mu.
+func (b *Buffer) evictOneLocked() (bool, error) {
 	for blk := b.lruTail; blk != nil; blk = blk.prev {
 		if blk.isClean() {
 			b.dropBlockLocked(blk)
 			b.statsEvictions.Add(1)
-			return nil
+			return true, nil
 		}
 	}
 	// All blocks are dirty. Flush the oldest, then drop it.
 	if b.lruTail == nil {
-		// Nothing to evict — caller is asking for room we can't provide.
-		// This shouldn't happen unless MemorySize < blockSize.
-		return nil
+		return false, nil
 	}
 	blk := b.lruTail
 	if err := b.flushBlockLocked(blk); err != nil {
-		return err
+		return false, err
 	}
 	b.dropBlockLocked(blk)
 	b.statsEvictions.Add(1)
-	return nil
+	return true, nil
 }
 
 // flushBlockLocked writes a block's dirty range to disk.
@@ -994,12 +1027,13 @@ func (b *Buffer) flushBlockLocked(blk *block) error {
 	if blk.isClean() {
 		return nil
 	}
-	lo, hi := blk.dirtyLo, blk.dirtyHi
-	if _, err := b.file.WriteAt(blk.data[lo:hi], blk.off+int64(lo)); err != nil {
-		return fmt.Errorf("buffer: flush block %d [%d,%d): %w", blk.off, lo, hi, err)
+	for _, ext := range blk.dirty {
+		if _, err := b.file.WriteAt(blk.data[ext.lo:ext.hi], blk.off+int64(ext.lo)); err != nil {
+			return fmt.Errorf("buffer: flush block %d [%d,%d): %w", blk.off, ext.lo, ext.hi, err)
+		}
+		b.statsFlushes.Add(1)
 	}
 	blk.clearDirty()
-	b.statsFlushes.Add(1)
 	return nil
 }
 
@@ -1009,7 +1043,6 @@ func (b *Buffer) flushBlockLocked(blk *block) error {
 // -----------------------------------------------------------------------
 
 func (b *Buffer) pushFrontLocked(blk *block) {
-	blk.lastAccess = nowNano()
 	blk.prev = nil
 	blk.next = b.lruHead
 	if b.lruHead != nil {
@@ -1091,4 +1124,3 @@ func (b *Buffer) markStateForBlockLocked(blockOff int64) {
 		slot.Store(stateSlow)
 	}
 }
-

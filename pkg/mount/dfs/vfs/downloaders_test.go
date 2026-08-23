@@ -2,6 +2,7 @@ package vfs
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -162,6 +163,7 @@ func TestStopAllClearsWaiters(t *testing.T) {
 		ctx:       ctx,
 		cancel:    cancel,
 	}
+	dls.stopCond = sync.NewCond(&dls.mu)
 
 	errCh := make(chan error, 1)
 	dls.waiters = append(dls.waiters, waiter{
@@ -202,6 +204,7 @@ func TestCacheItemReleaseStopsDownloadersOnZeroOpens(t *testing.T) {
 		ctx:       ctx,
 		cancel:    cancel,
 	}
+	dls.stopCond = sync.NewCond(&dls.mu)
 
 	item := &CacheItem{
 		downloaders: dls,
@@ -218,6 +221,210 @@ func TestCacheItemReleaseStopsDownloadersOnZeroOpens(t *testing.T) {
 
 	if got := item.opens.Load(); got != 0 {
 		t.Fatalf("unexpected opens after release: got %d, want 0", got)
+	}
+}
+
+// isCircuitOpen's cooldown-expiry path used to reset circuitOpen/circuitOpenAt
+// inline without going through resetCircuitLocked, leaking the cache-wide
+// circuitBreakers gauge by one every time a breaker expired via a read
+// hitting this path (as opposed to going idle first). This proves the gauge
+// comes back down.
+func TestIsCircuitOpen_CooldownExpiryDecrementsGauge(t *testing.T) {
+	cache := &Cache{}
+	item := &CacheItem{cache: cache}
+	dls := &Downloaders{item: item}
+
+	dls.mu.Lock()
+	dls.openCircuitLocked()
+	dls.mu.Unlock()
+
+	if got := cache.circuitBreakers.Load(); got != 1 {
+		t.Fatalf("expected circuitBreakers gauge = 1 after opening, got %d", got)
+	}
+
+	// Back-date circuitOpenAt so the cooldown reads as already expired.
+	dls.circuitOpenAt.Store(time.Now().Add(-circuitCooldownDuration - time.Second).UnixNano())
+
+	if dls.isCircuitOpen() {
+		t.Fatal("expected isCircuitOpen to report false once cooldown has expired")
+	}
+	if dls.circuitOpen.Load() {
+		t.Fatal("expected circuitOpen to be cleared after cooldown expiry")
+	}
+	if got := cache.circuitBreakers.Load(); got != 0 {
+		t.Fatalf("expected circuitBreakers gauge decremented back to 0, got %d", got)
+	}
+}
+
+// Close is a third way a Downloaders' life can end (alongside StopAll and
+// checkIdleTimeout, both of which already release the cache-wide
+// circuitBreakers gauge slot on their way out) — an item can be torn down
+// via idle-timeout eviction, a forced close, or process shutdown while its
+// breaker happens to be open, and Close previously never released that slot.
+func TestClose_ResetsOpenCircuitBreaker(t *testing.T) {
+	cache := &Cache{}
+	item := &CacheItem{cache: cache}
+	parentCtx := context.Background()
+	ctx, cancel := context.WithCancel(parentCtx)
+
+	dls := &Downloaders{
+		item:      item,
+		parentCtx: parentCtx,
+		ctx:       ctx,
+		cancel:    cancel,
+	}
+	dls.stopCond = sync.NewCond(&dls.mu)
+
+	dls.mu.Lock()
+	dls.openCircuitLocked()
+	dls.mu.Unlock()
+
+	if got := cache.circuitBreakers.Load(); got != 1 {
+		t.Fatalf("expected circuitBreakers gauge = 1 after opening, got %d", got)
+	}
+
+	if err := dls.Close(nil); err != nil {
+		t.Fatalf("Close returned error: %v", err)
+	}
+
+	if dls.circuitOpen.Load() {
+		t.Fatal("expected circuitOpen to be cleared after Close")
+	}
+	if got := cache.circuitBreakers.Load(); got != 0 {
+		t.Fatalf("expected circuitBreakers gauge decremented back to 0, got %d", got)
+	}
+}
+
+// DownloadWithPriority used to fail immediately with "downloaders stopping"
+// whenever a request landed during a StopAll() teardown window — even
+// though StopAll is designed to resume the session (it clears stopping once
+// the new ctx is installed), not just to shut down. This proves the call
+// now blocks through that window and succeeds once stopping clears, instead
+// of failing a request whose only problem was timing.
+func TestDownloadWithPriority_WaitsThroughStoppingWindow(t *testing.T) {
+	parentCtx := context.Background()
+	ctx, cancel := context.WithCancel(parentCtx)
+	defer cancel()
+
+	item := &CacheItem{
+		info: ItemInfo{
+			Size: 1024,
+			Rs:   ranges.Ranges{{Pos: 0, Size: 1024}}, // fully present: no network needed
+		},
+	}
+
+	dls := &Downloaders{
+		parentCtx: parentCtx,
+		ctx:       ctx,
+		cancel:    cancel,
+		item:      item,
+	}
+	dls.stopCond = sync.NewCond(&dls.mu)
+	dls.stopping = true
+
+	unblocked := make(chan error, 1)
+	go func() {
+		unblocked <- dls.DownloadWithPriority(context.Background(), ranges.Range{Pos: 0, Size: 1024}, true)
+	}()
+
+	// Give the goroutine time to reach the wait and confirm it's actually
+	// blocked, not racing past a bug that no-ops the wait.
+	select {
+	case err := <-unblocked:
+		t.Fatalf("DownloadWithPriority returned early (err=%v) instead of waiting out the stopping window", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	dls.mu.Lock()
+	dls.stopping = false
+	dls.stopCond.Broadcast()
+	dls.mu.Unlock()
+
+	select {
+	case err := <-unblocked:
+		if err != nil {
+			t.Fatalf("DownloadWithPriority returned an error after stopping cleared: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("DownloadWithPriority did not unblock after stopping cleared and stopCond was broadcast")
+	}
+}
+
+// A Downloaders that is permanently Close()d while a caller is waiting out a
+// stopping window must wake that caller with the terminal error instead of
+// hanging forever waiting for a stopping->false transition that will now
+// never come.
+func TestDownloadWithPriority_ErrorsIfClosedWhileWaiting(t *testing.T) {
+	parentCtx := context.Background()
+	ctx, cancel := context.WithCancel(parentCtx)
+
+	dls := &Downloaders{
+		parentCtx: parentCtx,
+		ctx:       ctx,
+		cancel:    cancel,
+		item:      &CacheItem{info: ItemInfo{Size: 1024}},
+	}
+	dls.stopCond = sync.NewCond(&dls.mu)
+	dls.stopping = true
+
+	unblocked := make(chan error, 1)
+	go func() {
+		unblocked <- dls.DownloadWithPriority(context.Background(), ranges.Range{Pos: 0, Size: 1024}, true)
+	}()
+
+	select {
+	case err := <-unblocked:
+		t.Fatalf("DownloadWithPriority returned early (err=%v) instead of waiting", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	if err := dls.Close(nil); err != nil {
+		t.Fatalf("Close returned error: %v", err)
+	}
+
+	select {
+	case err := <-unblocked:
+		if err == nil {
+			t.Fatal("expected DownloadWithPriority to return an error once Close ran, got nil")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("DownloadWithPriority hung instead of waking up when Close ran")
+	}
+}
+
+// A caller with no deadline of its own (context.Background(), the FUSE read
+// path's usual case) must not hang forever if stopping never clears — the
+// internal maxStoppingWaitNanos safety net must fire and return a clear
+// error instead.
+func TestDownloadWithPriority_TimesOutIfStoppingNeverClears(t *testing.T) {
+	prevWait := maxStoppingWaitNanos.Swap(int64(50 * time.Millisecond))
+	t.Cleanup(func() { maxStoppingWaitNanos.Store(prevWait) })
+
+	parentCtx := context.Background()
+	ctx, cancel := context.WithCancel(parentCtx)
+	defer cancel()
+
+	dls := &Downloaders{
+		parentCtx: parentCtx,
+		ctx:       ctx,
+		cancel:    cancel,
+		item:      &CacheItem{info: ItemInfo{Size: 1024}},
+	}
+	dls.stopCond = sync.NewCond(&dls.mu)
+	dls.stopping = true // deliberately never cleared
+
+	unblocked := make(chan error, 1)
+	go func() {
+		unblocked <- dls.DownloadWithPriority(context.Background(), ranges.Range{Pos: 0, Size: 1024}, true)
+	}()
+
+	select {
+	case err := <-unblocked:
+		if err == nil {
+			t.Fatal("expected DownloadWithPriority to time out and return an error, got nil")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("DownloadWithPriority hung past the shortened safety-net timeout — stuck stopping=true should degrade to an error, not a permanent hang")
 	}
 }
 

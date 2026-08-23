@@ -324,7 +324,10 @@ func (ad *AllDebrid) GetTorrent(torrentId string) (*types.Torrent, error) {
 		return nil, fmt.Errorf("alldebrid API error: Status: %d", resp.StatusCode)
 	}
 
-	data := res.Data.Magnets
+	data, err := findMagnet(res.Data.Magnets, torrentId)
+	if err != nil {
+		return nil, err
+	}
 	status := getAlldebridStatus(data.StatusCode)
 	name := data.Filename
 	t := &types.Torrent{
@@ -366,7 +369,10 @@ func (ad *AllDebrid) UpdateTorrent(t *types.Torrent) error {
 		return fmt.Errorf("alldebrid API error: Status: %d", resp.StatusCode)
 	}
 
-	data := res.Data.Magnets
+	data, err := findMagnet(res.Data.Magnets, t.Id)
+	if err != nil {
+		return err
+	}
 	status := getAlldebridStatus(data.StatusCode)
 	name := data.Filename
 	t.Name = name
@@ -392,6 +398,21 @@ func (ad *AllDebrid) UpdateTorrent(t *types.Torrent) error {
 		t.Speed = data.DownloadSpeed
 	}
 	return nil
+}
+
+// findMagnet picks the magnet matching torrentId out of a /magnet/status
+// response. AllDebrid's Magnets type can decode a single object, a map, or
+// an array (see its UnmarshalJSON) — a single-magnet status call can still
+// come back as any of those shapes, so the caller can't assume the first (or
+// only) entry is the one requested.
+func findMagnet(magnets Magnets, torrentId string) (magnetInfo, error) {
+	for _, magnet := range magnets {
+		if strconv.Itoa(magnet.Id) == torrentId {
+			return magnet, nil
+		}
+	}
+
+	return magnetInfo{}, customerror.TorrentNotFoundError
 }
 
 func (ad *AllDebrid) CheckStatus(torrent *types.Torrent) (*types.Torrent, error) {
