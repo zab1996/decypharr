@@ -1257,6 +1257,7 @@ class ConfigManager {
             const backupInput = getField('backup');
             const subscriptionExpiryInput = getField('subscription_expiry');
             const autoRenewInput = getField('auto_renew');
+            const minIdleConnectionsInput = getField('min_idle_connections');
 
             if (!hostInput || !portInput || !usernameInput || !passwordInput || !backboneInput || !sslInput || !maxConnectionsInput || !priorityInput) {
                 return;
@@ -1277,7 +1278,10 @@ class ConfigManager {
                 backup: backupInput ? backupInput.checked : false,
                 // Informational only - subscription tracking shown on Stats.
                 subscription_expiry: subscriptionExpiryInput ? subscriptionExpiryInput.value.trim() : '',
-                auto_renew: autoRenewInput ? autoRenewInput.checked : false
+                auto_renew: autoRenewInput ? autoRenewInput.checked : false,
+                // Optional and defaults 0 (off) — old form versions shouldn't
+                // accidentally start proactively warming connections.
+                min_idle_connections: minIdleConnectionsInput ? (parseInt(minIdleConnectionsInput.value) || 0) : 0
             };
 
             if (provider.host && provider.username && provider.password) {
@@ -1971,6 +1975,16 @@ class ConfigManager {
                                name="usenet.providers[${index}].subscription_expiry"
                                id="usenet_provider_${index}_subscription_expiry">
                         <span class="text-sm opacity-70">Optional - shown on the Stats page so you can track renewals</span>
+                    </div>
+                    <div>
+                        <label class="label" for="usenet_provider_${index}_min_idle_connections">
+                            <span class="font-medium">Min Idle Connections</span>
+                        </label>
+                        <input type="number" class="input w-full" min="0"
+                               name="usenet.providers[${index}].min_idle_connections"
+                               id="usenet_provider_${index}_min_idle_connections"
+                               placeholder="0">
+                        <span class="text-sm opacity-70">Keep this many connections pre-dialed and idle so the first stream after a restart skips the TCP/TLS handshake (default: 0, off)</span>
                     </div>
                 </div>
 
