@@ -389,6 +389,9 @@ func (m *Manager) getTorrentChildren(name string) (*FileInfo, []FileInfo) {
 	size := int64(0)
 	var firstInfoHash string
 	for _, file := range entry.Files {
+		if file.Deleted {
+			continue
+		}
 		if firstInfoHash == "" {
 			firstInfoHash = file.InfoHash
 		}
@@ -509,9 +512,15 @@ func (m *Manager) RemoveTorrentFile(torrentName, filename string) error {
 	if err != nil {
 		return fmt.Errorf("entry %s not found", torrentName)
 	}
-	file, err := item.GetFile(filename)
-	if err != nil {
+	file, exists := item.Files[filename]
+	if !exists {
 		return fmt.Errorf("file %s not found in entry %s", filename, torrentName)
+	}
+	if file.Deleted {
+		// Already removed - deleting again is a no-op, not an error.
+		// Keeps retries/duplicate delete requests idempotent instead of
+		// permanently failing on a file that's already gone.
+		return nil
 	}
 	file.Deleted = true
 	item.Files[filename] = file

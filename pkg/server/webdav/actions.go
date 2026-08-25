@@ -35,6 +35,7 @@ func (h *Handler) handleGet(current *manager.FileInfo, w http.ResponseWriter, r 
 
 func (h *Handler) handleDelete(current *manager.FileInfo, w http.ResponseWriter, r *http.Request) {
 	if err := h.manager.RemoveEntry(current); err != nil {
+		h.logger.Rate(current.Name()).Error().Err(err).Msgf("Error deleting entry: %s", current.Name())
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
