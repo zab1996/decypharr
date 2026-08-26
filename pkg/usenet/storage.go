@@ -166,6 +166,16 @@ func (s *NZBStorage) GetNZB(id string) (*storage.NZB, error) {
 	return protoToNZB(&pb), nil
 }
 
+// GetNZBHeader retrieves an NZB. Currently identical to GetNZB — this fork's
+// meta files use a single full-decode protobuf format, not upstream's
+// separate v2 header-only codec (deliberately deferred; see the NNTP 2.4
+// backport notes). Kept as a distinct method so callers that only need
+// scalar/file metadata, not the full segment map, express that intent now
+// and get the cheaper path for free if a header-only codec lands later.
+func (s *NZBStorage) GetNZBHeader(id string) (*storage.NZB, error) {
+	return s.GetNZB(id)
+}
+
 // DeleteNZB removes an NZB from file storage
 func (s *NZBStorage) DeleteNZB(id string) error {
 	s.mu.Lock()

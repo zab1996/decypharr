@@ -69,7 +69,10 @@ LABEL org.opencontainers.image.authors="mash2k3"
 LABEL org.opencontainers.image.documentation="https://github.com/mash2k3/decypharr/blob/dev/README.md"
 
 # Install dependencies including rclone (from binary)
-RUN apk add --no-cache fuse3 ca-certificates su-exec shadow curl unzip tzdata && \
+# tini runs as PID 1 so it can forward signals to cli_mount for graceful
+# shutdown/unmount, and reap any orphaned grandchild processes (e.g. helpers
+# spawned by rclone) that would otherwise linger as zombies.
+RUN apk add --no-cache fuse3 ca-certificates su-exec shadow curl unzip tzdata tini && \
     echo "user_allow_other" >> /etc/fuse.conf && \
     case "$(uname -m)" in \
         x86_64) ARCH=amd64 ;; \
@@ -101,5 +104,5 @@ VOLUME ["/app"]
 
 HEALTHCHECK --interval=10s --retries=10 CMD ["/usr/bin/healthcheck", "--config", "/app"]
 
-ENTRYPOINT ["/entrypoint.sh"]
+ENTRYPOINT ["/sbin/tini", "--", "/entrypoint.sh"]
 CMD ["/usr/bin/cli_mount", "--config", "/app"]

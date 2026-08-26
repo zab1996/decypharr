@@ -1207,6 +1207,24 @@
 						: '';
 					const healthMessage = health.error || health.detail || '';
 					const healthMessageClass = health.error ? 'text-error' : 'text-warning';
+
+					let subscriptionHtml = '';
+					if (provider.subscription_expiry) {
+						const expiryDate = new Date(`${provider.subscription_expiry}T00:00:00`);
+						const daysLeft = Math.ceil((expiryDate.getTime() - Date.now()) / 86400000);
+						const expiryClass = daysLeft < 0 ? 'text-error' : (daysLeft <= 7 ? 'text-error' : (daysLeft <= 30 ? 'text-warning' : 'text-base-content/70'));
+						const daysText = daysLeft < 0
+							? `expired ${Math.abs(daysLeft)}d ago`
+							: (daysLeft === 0 ? 'expires today' : `${daysLeft}d left`);
+						const renewalText = provider.auto_renew ? 'Auto-renews' : 'Manual renewal';
+						subscriptionHtml = `
+							<div class="text-xs ${expiryClass} mt-1">
+								<i class="bi bi-calendar-event"></i>
+								Plan ends ${expiryDate.toLocaleDateString()} (${daysText}) · ${renewalText}
+							</div>
+						`;
+					}
+
                     let speedResultHtml = '';
                     if (speedTest && speedTest.tested_at) {
 						const speedTestAgeMs = Date.now() - new Date(speedTest.tested_at).getTime();
@@ -1232,6 +1250,7 @@
                                             <span class="badge ${provider.ssl ? 'badge-success' : 'badge-warning'} badge-xs">${provider.ssl ? 'SSL' : 'Plain'}</span>
                                         </div>
                                         <p class="text-xs text-base-content/70">${provider.max_connections || 0} connections</p>
+                                        ${subscriptionHtml}
                                     </div>
                                     <div class="flex flex-col items-end gap-1">
 										<span class="badge ${healthClass} badge-sm gap-1">

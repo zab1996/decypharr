@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -266,7 +267,24 @@ func (m *Manager) initLinkService() {
 
 func (m *Manager) initJobQueue() {
 	m.jobQueue = NewJobQueue(m.ctx, m.config.MaxActiveDownloads, m.processJob)
-	m.restoreActiveDownloadJobs()
+	// Restoring a large active-download queue can take 60-90 minutes
+	// (re-parsing every in-flight NZB/torrent). Running it synchronously
+	// here blocked Manager construction — and therefore the HTTP server —
+	// for the whole duration, during which arrs see "download client
+	// unavailable". Background it instead, with the same panic-recovery
+	// pattern JobQueue.runJob uses, so a panic here can't take the process
+	// down before it's even finished starting.
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				m.logger.Error().
+					Interface("panic", r).
+					Bytes("stack", debug.Stack()).
+					Msg("Recovered from panic while restoring active download jobs")
+			}
+		}()
+		m.restoreActiveDownloadJobs()
+	}()
 }
 
 func (m *Manager) processJob(ctx context.Context, job *Job) {

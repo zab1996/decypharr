@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -68,12 +69,37 @@ type fsEntry struct {
 	lastAccessed  atomic.Int64 // Unix timestamp
 }
 
+// fsEntryTombstone marks an entry claimed for teardown. Once refCount holds
+// this value no new stream can acquire the entry (see acquire), which is what
+// makes cleanup safe against a concurrent Stream that already Load()ed the
+// entry from the map.
+const fsEntryTombstone = int32(-1 << 30)
+
 func (fe *fsEntry) cleanup() {
 	if fe.readerCleanup != nil {
 		fe.readerCleanup()
 		fe.readerCleanup = nil
 		fe.reader = nil
 	}
+}
+
+// acquire takes a reference unless the entry has been claimed for teardown.
+func (fe *fsEntry) acquire() bool {
+	for {
+		n := fe.refCount.Load()
+		if n < 0 {
+			return false
+		}
+		if fe.refCount.CompareAndSwap(n, n+1) {
+			return true
+		}
+	}
+}
+
+// claimForCleanup atomically claims an idle (refCount == 0) entry for
+// teardown, fencing out any future acquire.
+func (fe *fsEntry) claimForCleanup() bool {
+	return fe.refCount.CompareAndSwap(0, fsEntryTombstone)
 }
 
 // getOrCreateReader returns the shared reader, creating it lazily on first use.
@@ -113,6 +139,11 @@ func (fe *fsEntry) getOrCreateReader() (fs.PrefetchableReaderAt, int64, error) {
 
 	if fe.readerErr != nil {
 		return nil, 0, fe.readerErr
+	}
+	// cleanup() nils the reader after the Once has fired; a caller racing a
+	// shutdown-path cleanup must get an error, not a nil interface.
+	if fe.reader == nil {
+		return nil, 0, fmt.Errorf("reader has been closed")
 	}
 	return fe.reader, fe.readerSize, nil
 }
@@ -301,9 +332,11 @@ func (u *Usenet) createEntry(file *storage.NZBFile) (*fsEntry, error) {
 func (u *Usenet) getOrCreateEntry(ctx context.Context, nzoID, filename string) (*fsEntry, string, error) {
 	key := fsKey(nzoID, filename)
 
-	// Fast path: entry already exists
-	if entry, ok := u.fs.Load(key); ok {
-		entry.refCount.Add(1)
+	// Fast path: entry already exists and isn't being torn down. acquire() (a
+	// CAS, not a blind Add) is what closes the race against cleanupIdleFS:
+	// once the janitor claims an idle entry no new reference can be taken, so
+	// a stream can never end up on an entry whose reader is being closed.
+	if entry, ok := u.fs.Load(key); ok && entry.acquire() {
 		entry.lastAccessed.Store(utils.NowUnix())
 		return entry, key, nil
 	}
@@ -325,19 +358,28 @@ func (u *Usenet) getOrCreateEntry(ctx context.Context, nzoID, filename string) (
 	}
 
 	// Atomically store only if key doesn't exist (prevents race condition)
-	actual, loaded := u.fs.LoadOrStore(key, newEntry)
-	if loaded {
-		// Another goroutine created the entry first - use theirs
-		// Our newEntry was never used, cleanup will happen via GC
-		actual.refCount.Add(1)
-		actual.lastAccessed.Store(utils.NowUnix())
-		return actual, key, nil
+	for {
+		actual, loaded := u.fs.LoadOrStore(key, newEntry)
+		if !loaded {
+			// We won the race - use our new entry
+			newEntry.refCount.Add(1)
+			newEntry.lastAccessed.Store(utils.NowUnix())
+			return newEntry, key, nil
+		}
+		// Another goroutine created the entry first - use theirs.
+		// Our newEntry was never used (readers are lazy), GC reclaims it.
+		if actual.acquire() {
+			actual.lastAccessed.Store(utils.NowUnix())
+			return actual, key, nil
+		}
+		// The mapped entry is claimed for teardown; the janitor removes it
+		// from the map immediately after claiming, so retry until our entry
+		// can be stored.
+		if err := ctx.Err(); err != nil {
+			return nil, key, err
+		}
+		runtime.Gosched()
 	}
-
-	// We won the race - use our new entry
-	newEntry.refCount.Add(1)
-	newEntry.lastAccessed.Store(utils.NowUnix())
-	return newEntry, key, nil
 }
 
 // releaseFS releases an fs entry using a pre-computed key (avoids redundant allocation).
@@ -367,9 +409,15 @@ func (u *Usenet) cleanupIdleFS() {
 			if entry.refCount.Load() == 0 {
 				lastUsed := entry.lastAccessed.Load()
 				if now-lastUsed > idleThreshold {
-					// Cleanup
-					entry.cleanup()
-					u.fs.Delete(key)
+					// Claim before touching anything: the CAS fences out a
+					// concurrent Stream that already Load()ed this entry from
+					// the map (it will fail acquire() and create a fresh
+					// entry). Delete from the map before the (potentially
+					// slow) cleanup so waiting creators aren't stalled.
+					if entry.claimForCleanup() {
+						u.fs.Delete(key)
+						entry.cleanup()
+					}
 				}
 			}
 			return true
@@ -409,7 +457,7 @@ func (u *Usenet) ParseWithID(ctx context.Context, id, name string, content []byt
 	nzb.Category = category
 	nzb.Status = NZBStatusParsing
 	// Save NZB file to disk
-	nzbPath, err := u.saveNZBFile(name, content)
+	nzbPath, err := u.saveNZBFile(nzb.ID, content)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -417,10 +465,15 @@ func (u *Usenet) ParseWithID(ctx context.Context, id, name string, content []byt
 
 	// Mark as processing
 	if err := u.markAsProcessing(nzb); err != nil {
+		// Don't leave the source file orphaned; an un-marked .nzb would be
+		// re-claimed by the refresh watcher on every scan.
+		_ = os.Remove(nzbPath)
 		return nil, nil, fmt.Errorf("failed to mark NZB as processing: %w", err)
 	}
 
 	if err := u.nzbStorage.AddNZB(nzb); err != nil {
+		_ = os.Remove(nzbPath + ".processing")
+		_ = os.Remove(nzbPath)
 		return nil, nil, fmt.Errorf("failed to save NZB to storage: %w", err)
 	}
 
@@ -994,6 +1047,12 @@ func (u *Usenet) GetNZB(id string) (*storage.NZB, error) {
 	return u.nzbStorage.GetNZB(id)
 }
 
+// GetNZBHeader returns NZB metadata by ID via the cheaper header-oriented
+// path (see NZBStorage.GetNZBHeader).
+func (u *Usenet) GetNZBHeader(id string) (*storage.NZB, error) {
+	return u.nzbStorage.GetNZBHeader(id)
+}
+
 // ForEachNZB iterates over all NZBs
 func (u *Usenet) ForEachNZB(fn func(*storage.NZB) error) error {
 	return u.nzbStorage.ForEachNZB(fn)
@@ -1043,8 +1102,14 @@ func (u *Usenet) GetSpeedTestResults() map[string]nntp.SpeedTestResult {
 	return u.nntp.GetSpeedTestResults()
 }
 
-func (u *Usenet) saveNZBFile(name string, content []byte) (string, error) {
-	path := filepath.Join(u.metadataDir, name)
+func (u *Usenet) saveNZBFile(id string, content []byte) (string, error) {
+	// Store the raw source keyed by the bounded NZB ID rather than the
+	// (untrusted, arbitrarily long) display name. ext4 caps a path component at
+	// 255 bytes; a long release name plus a ".processing"/".importing"/".queued"
+	// marker suffix blew past that limit, which failed the rename, wedged the
+	// refresh watcher, and left truncated fragment files behind. The UUID keeps
+	// every derived name comfortably under the cap.
+	path := filepath.Join(u.metadataDir, id+".nzb")
 	if err := os.WriteFile(path, content, 0644); err != nil {
 		return "", fmt.Errorf("failed to save NZB file to disk: %w", err)
 	}
@@ -1189,7 +1254,12 @@ func (u *Usenet) ClaimNewNZBs() ([]PendingNZB, error) {
 				if os.IsNotExist(err) {
 					continue
 				}
-				return nil, fmt.Errorf("failed to claim NZB %s: %w", name, err)
+				// Skip this entry instead of aborting the whole scan. A single
+				// poison file (e.g. a name so long that appending ".importing"
+				// exceeds the filesystem limit) previously failed every refresh
+				// and permanently blocked all other pending NZBs.
+				u.logger.Error().Err(err).Str("name", name).Msg("Failed to claim NZB; skipping")
+				continue
 			}
 		}
 

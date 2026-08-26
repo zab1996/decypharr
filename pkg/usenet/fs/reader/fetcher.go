@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -32,8 +33,9 @@ type SegmentFetcher struct {
 	inFlightMu sync.Mutex
 
 	// Background prefetch
-	prefetchCh chan int
-	prefetchWg sync.WaitGroup
+	prefetchCh     chan int
+	prefetchQueued []atomic.Uint64 // one deduplication bit per segment
+	prefetchWg     sync.WaitGroup
 
 	// Lifecycle
 	ctx    context.Context
@@ -71,8 +73,12 @@ func NewSegmentFetcher(
 		semaphore:  make(chan struct{}, maxConns),
 		inFlight:   make(map[int]*fetchPromise),
 		prefetchCh: make(chan int, 256), // Buffer for prefetch hints
-		ctx:        ctx,
-		cancel:     cancel,
+		// A packed atomic bitmap keeps duplicate suppression cheap even for
+		// very large NZBs: 100k segments consume about 12 KiB, versus roughly
+		// 400 KiB for one atomic.Bool per segment.
+		prefetchQueued: make([]atomic.Uint64, (cache.SegmentCount()+63)/64),
+		ctx:            ctx,
+		cancel:         cancel,
 	}
 
 	// Start fewer prefetch workers than foreground connection slots. Seeky
@@ -266,6 +272,32 @@ func (sf *SegmentFetcher) doFetch(ctx context.Context, segIdx int) error {
 	return nil
 }
 
+func (sf *SegmentFetcher) markPrefetchQueued(segIdx int) bool {
+	if segIdx < 0 || segIdx >= sf.cache.SegmentCount() {
+		return false
+	}
+	word := &sf.prefetchQueued[segIdx>>6]
+	mask := uint64(1) << uint(segIdx&63)
+	for {
+		old := word.Load()
+		if old&mask != 0 {
+			return false
+		}
+		if word.CompareAndSwap(old, old|mask) {
+			return true
+		}
+	}
+}
+
+func (sf *SegmentFetcher) clearPrefetchQueued(segIdx int) {
+	if segIdx < 0 || segIdx >= sf.cache.SegmentCount() {
+		return
+	}
+	word := &sf.prefetchQueued[segIdx>>6]
+	mask := uint64(1) << uint(segIdx&63)
+	word.And(^mask)
+}
+
 // QueuePrefetch adds a segment to the background prefetch queue (non-blocking).
 func (sf *SegmentFetcher) QueuePrefetch(segIdx int) {
 	// Check if already cached
@@ -273,11 +305,18 @@ func (sf *SegmentFetcher) QueuePrefetch(segIdx int) {
 	if state == StateOnDisk || state == StateFetching {
 		return
 	}
+	// State remains Empty while a hint is waiting in prefetchCh. Track that
+	// interval separately so frequent small ReadAt calls cannot enqueue the
+	// same read-ahead window hundreds of times and crowd useful hints out.
+	if !sf.markPrefetchQueued(segIdx) {
+		return
+	}
 
 	select {
 	case sf.prefetchCh <- segIdx:
 		// Queued successfully
 	default:
+		sf.clearPrefetchQueued(segIdx)
 		// Queue full, drop the hint
 		sf.stats.PrefetchMisses.Add(1)
 	}
@@ -303,6 +342,7 @@ func (sf *SegmentFetcher) prefetchWorker(id int) {
 				return
 			}
 			sf.prefetchOne(segIdx)
+			sf.clearPrefetchQueued(segIdx)
 		}
 	}
 }
@@ -325,20 +365,66 @@ func (sf *SegmentFetcher) prefetchOne(segIdx int) {
 }
 
 // EnsureSegments fetches all segments in the range, returning when all are
-// available. Segments are fetched in order; in steady-state playback the
-// background prefetch workers have already downloaded them, so this loop
-// usually just confirms cache presence. fetchWithRetry keeps a single
-// transient segment failure from tearing down the whole stream.
+// available. Missing segments are fetched concurrently — the connection
+// semaphore still caps real parallelism — so a cold multi-segment read (a
+// seek, or playback catching up to the prefetch front) pays roughly one
+// download's latency instead of one per segment. In steady-state playback the
+// background prefetch workers have already downloaded them, so this usually
+// just confirms cache presence. fetchWithRetry keeps a single transient
+// segment failure from tearing down the whole stream.
 func (sf *SegmentFetcher) EnsureSegments(ctx context.Context, startSeg, endSeg int) error {
+	var missing []int
 	for i := startSeg; i <= endSeg; i++ {
-		state := sf.cache.GetState(i)
-		if state != StateOnDisk {
-			if err := sf.fetchWithRetry(ctx, i); err != nil {
-				return err
-			}
+		if sf.cache.GetState(i) != StateOnDisk {
+			missing = append(missing, i)
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	if len(missing) == 1 {
+		return sf.fetchWithRetry(ctx, missing[0])
+	}
+
+	errs := make([]error, len(missing))
+	var wg sync.WaitGroup
+	for j, segIdx := range missing {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs[j] = sf.fetchWithRetry(ctx, segIdx)
+		}()
+	}
+	wg.Wait()
+
+	// Report the failure of the lowest segment: that's where the caller's
+	// read would have stopped under the old sequential behavior.
+	for _, err := range errs {
+		if err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+// CancelPendingPrefetch drains every queued prefetch hint. The reader calls
+// this when it detects a seek: hints for the abandoned window would otherwise
+// keep the prefetch workers — and the connection slots they hold — busy
+// downloading data the player just jumped away from (up to a full read-ahead
+// window of stale segments) while the blocking foreground read competes for
+// leftovers. In-flight downloads are left to finish: a segment completes in
+// well under a second and lands in the cache anyway; only not-yet-started
+// work is dropped.
+func (sf *SegmentFetcher) CancelPendingPrefetch() {
+	for {
+		select {
+		case segIdx := <-sf.prefetchCh:
+			sf.clearPrefetchQueued(segIdx)
+			sf.stats.PrefetchCancelled.Add(1)
+		default:
+			return
+		}
+	}
 }
 
 // fetchWithRetry fetches a single segment, retrying transient failures so a
@@ -394,9 +480,13 @@ func (sf *SegmentFetcher) retryBackoff(attempt int) time.Duration {
 }
 
 // Close stops all workers and waits for them to finish.
+//
+// prefetchCh is deliberately never closed: QueuePrefetch can race Close (a
+// ReadAtContext already past the reader's closed check), and a send on a
+// closed channel panics even inside a select. Workers exit via sf.ctx instead,
+// and the channel is garbage-collected with the fetcher.
 func (sf *SegmentFetcher) Close() {
 	sf.cancel()
-	close(sf.prefetchCh)
 	sf.prefetchWg.Wait()
 }
 

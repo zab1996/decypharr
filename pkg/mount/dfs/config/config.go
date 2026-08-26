@@ -79,7 +79,6 @@ func ParseFuseConfig() *FuseConfig {
 	fuseConfig.CacheDir = cfg.CacheDir
 	fuseConfig.MountPath = mainCfg.Mount.MountPath
 	fuseConfig.BufferMemory = cfg.BufferMemoryBytes()
-	fuseConfig.BufferMemory = cfg.BufferMemoryBytes()
 
 	if cfg.DaemonTimeout != "" {
 		timeout, err := utils.ParseDuration(cfg.DaemonTimeout)
@@ -137,7 +136,6 @@ func ParseFuseConfig() *FuseConfig {
 	fuseConfig.PlexToken = cfg.PlexToken
 	fuseConfig.PrewarmMaxBytes = cfg.PrewarmMaxSizeBytes()
 
-	// Otherwise keep the default (4) from DefaultFuseConfig()
 	fuseConfig.UID = cfg.UID
 	fuseConfig.GID = cfg.GID
 

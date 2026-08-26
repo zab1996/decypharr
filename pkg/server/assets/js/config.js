@@ -1255,6 +1255,9 @@ class ConfigManager {
             const maxConnectionsInput = getField('max_connections');
             const priorityInput = getField('priority');
             const backupInput = getField('backup');
+            const subscriptionExpiryInput = getField('subscription_expiry');
+            const autoRenewInput = getField('auto_renew');
+            const minIdleConnectionsInput = getField('min_idle_connections');
 
             if (!hostInput || !portInput || !usernameInput || !passwordInput || !backboneInput || !sslInput || !maxConnectionsInput || !priorityInput) {
                 return;
@@ -1272,7 +1275,13 @@ class ConfigManager {
                 // Backup is optional and defaults false — old form versions
                 // (or missing inputs after a hot-reload) shouldn't accidentally
                 // turn a primary into a backup.
-                backup: backupInput ? backupInput.checked : false
+                backup: backupInput ? backupInput.checked : false,
+                // Informational only - subscription tracking shown on Stats.
+                subscription_expiry: subscriptionExpiryInput ? subscriptionExpiryInput.value.trim() : '',
+                auto_renew: autoRenewInput ? autoRenewInput.checked : false,
+                // Optional and defaults 0 (off) — old form versions shouldn't
+                // accidentally start proactively warming connections.
+                min_idle_connections: minIdleConnectionsInput ? (parseInt(minIdleConnectionsInput.value) || 0) : 0
             };
 
             if (provider.host && provider.username && provider.password) {
@@ -1288,6 +1297,7 @@ class ConfigManager {
                 || 15,
             read_ahead: document.querySelector('[name="usenet.read_ahead"]').value || "16MB",
             processing_timeout: document.querySelector('[name="usenet.processing_timeout"]')?.value || "5m",
+            conn_idle_timeout: document.querySelector('[name="usenet.conn_idle_timeout"]')?.value || "",
             availability_sample_percent: parseInt(document.querySelector('[name="usenet.availability_sample_percent"]')?.value) || 10,
             import_availability_sample_percent: parseInt(document.querySelector('[name="usenet.import_availability_sample_percent"]')?.value) || 1,
             disk_buffer_path: document.querySelector('[name="usenet.disk_buffer_path"]')?.value || "",
@@ -1823,6 +1833,7 @@ class ConfigManager {
             'processing_max_connections': usenet.processing_max_connections,
             'read_ahead': usenet.read_ahead,
             'processing_timeout': usenet.processing_timeout,
+            'conn_idle_timeout': usenet.conn_idle_timeout,
             'availability_sample_percent': usenet.availability_sample_percent,
             'import_availability_sample_percent': usenet.import_availability_sample_percent,
             'disk_buffer_path': usenet.disk_buffer_path,
@@ -1956,6 +1967,25 @@ class ConfigManager {
                                id="usenet_provider_${index}_priority">
                         <span class="text-sm opacity-70">Priority for this provider (lower number = higher priority)</span>
                     </div>
+                    <div>
+                        <label class="label" for="usenet_provider_${index}_subscription_expiry">
+                            <span class="font-medium">Subscription End Date</span>
+                        </label>
+                        <input type="date" class="input w-full"
+                               name="usenet.providers[${index}].subscription_expiry"
+                               id="usenet_provider_${index}_subscription_expiry">
+                        <span class="text-sm opacity-70">Optional - shown on the Stats page so you can track renewals</span>
+                    </div>
+                    <div>
+                        <label class="label" for="usenet_provider_${index}_min_idle_connections">
+                            <span class="font-medium">Min Idle Connections</span>
+                        </label>
+                        <input type="number" class="input w-full" min="0"
+                               name="usenet.providers[${index}].min_idle_connections"
+                               id="usenet_provider_${index}_min_idle_connections"
+                               placeholder="0">
+                        <span class="text-sm opacity-70">Keep this many connections pre-dialed and idle so the first stream after a restart skips the TCP/TLS handshake (default: 0, off)</span>
+                    </div>
                 </div>
 
                 <div class="flex flex-wrap gap-4 mt-4">
@@ -1971,6 +2001,13 @@ class ConfigManager {
                                name="usenet.providers[${index}].backup"
                                id="usenet_provider_${index}_backup">
                         <span class="text-sm">Backup provider (fallback only)</span>
+                    </label>
+                    <label class="flex items-center gap-2 cursor-pointer"
+                           title="Informational only - does not affect connections or billing. Shown next to the subscription end date on the Stats page.">
+                        <input type="checkbox" class="checkbox checkbox-sm"
+                               name="usenet.providers[${index}].auto_renew"
+                               id="usenet_provider_${index}_auto_renew">
+                        <span class="text-sm">Auto-renews</span>
                     </label>
                 </div>
             </div>

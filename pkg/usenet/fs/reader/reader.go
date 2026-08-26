@@ -61,6 +61,12 @@ type StreamingReader struct {
 	// Read position for io.Reader interface
 	readOffset atomic.Int64
 
+	// lastEndSeg is the final segment index of the most recent ReadAt,
+	// used to detect seeks (-1 until the first read). Concurrent reads from
+	// kernel readahead land within one prefetch window of each other and
+	// never trip the detector; only a genuine jump does.
+	lastEndSeg atomic.Int64
+
 	// Lifecycle
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -117,8 +123,23 @@ func NewStreamingReader(
 		logger:    logger,
 		stats:     stats,
 	}
+	sr.lastEndSeg.Store(-1)
 
 	return sr, nil
+}
+
+// seekAbandonedWindow reports whether a read landing on [startSeg, endSeg]
+// after a previous read that ended at prevEnd constitutes a seek that
+// abandons the queued read-ahead window. Reads within one prefetch window of
+// the previous position (in either direction) are sequential-ish — kernel
+// readahead reorders and overlaps small reads constantly — and keep their
+// queued hints. Anything further is a jump whose pending hints are dead
+// weight.
+func seekAbandonedWindow(prevEnd int64, startSeg, endSeg, ahead int) bool {
+	if prevEnd < 0 || ahead <= 0 {
+		return false
+	}
+	return int64(startSeg) > prevEnd+int64(ahead) || int64(endSeg) < prevEnd-int64(ahead)
 }
 
 // NewStreamingReaderWithEncryption creates an encrypted reader.
@@ -192,6 +213,15 @@ func (sr *StreamingReader) readAtPlain(ctx context.Context, p []byte, off int64)
 	sr.cache.PinRange(startSeg, endSeg)
 	defer sr.cache.UnpinRange(startSeg, endSeg)
 
+	// On a seek, drop the read-ahead hints queued for the old position
+	// BEFORE queueing the new window — otherwise the prefetch workers spend
+	// the next seconds downloading up to a full window of data the player
+	// jumped away from while this read waits for connection slots.
+	prevEnd := sr.lastEndSeg.Swap(int64(endSeg))
+	if seekAbandonedWindow(prevEnd, startSeg, endSeg, sr.config.PrefetchAhead) {
+		sr.fetcher.CancelPendingPrefetch()
+	}
+
 	// Queue prefetch for read-ahead (non-blocking)
 	prefetchEnd := min(endSeg+sr.config.PrefetchAhead, sr.segCount-1)
 	if prefetchEnd > endSeg {
@@ -235,6 +265,9 @@ func (sr *StreamingReader) readAtPlain(ctx context.Context, p []byte, off int64)
 // progressive performance degradation on large files.
 func (sr *StreamingReader) readFromCache(ctx context.Context, p []byte, off int64, startSeg, endSeg int) (int, error) {
 	totalRead := 0
+	// filled is the absolute offset this read has delivered through. Segments
+	// must cover disjoint, ascending ranges; see the overlap check below.
+	filled := off
 
 	for segIdx := startSeg; segIdx <= endSeg; segIdx++ {
 		// Wait for segment to be ready
@@ -251,6 +284,14 @@ func (sr *StreamingReader) readFromCache(ctx context.Context, p []byte, off int6
 
 		if readStart >= readEnd {
 			continue
+		}
+		if readStart < filled {
+			// Two segments claim the same bytes. Their copies would land on
+			// top of each other in p while totalRead counted both, so the
+			// read would report more bytes than p can hold and panic the
+			// caller's copy loop. computeOffsets rejects such tables up
+			// front; anything reaching here is a bug, not bad metadata.
+			return totalRead, fmt.Errorf("segment %d starts at %d, behind delivered offset %d", segIdx, readStart, filled)
 		}
 
 		outOffset := readStart - off
@@ -269,6 +310,7 @@ func (sr *StreamingReader) readFromCache(ctx context.Context, p []byte, off int6
 		}
 
 		totalRead += n
+		filled = readEnd
 	}
 
 	return totalRead, nil

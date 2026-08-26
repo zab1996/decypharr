@@ -167,10 +167,15 @@ func (s *Server) handleAddContent(w http.ResponseWriter, r *http.Request) {
 	results := mapper.Map(tasks, func(task *addTask) *manager.ImportRequest {
 		switch task.taskType {
 		case "error":
-			// Task already failed during collection phase
+			// Task already failed during collection phase. task.source already holds
+			// a correctly-worded reason for whichever step failed (torrent URL/file
+			// parse, NZB URL fetch, NZB file read) - use it instead of hardcoding a
+			// torrent-shaped message from task.name/task.magnet, which are unset for
+			// every non-torrent failure and previously produced the meaningless
+			// "Failed to import torrent : <nil>" for NZB failures.
 			return &manager.ImportRequest{
 				Status: "error",
-				Error:  fmt.Sprintf("Failed to import torrent %s: %v", task.name, task.magnet),
+				Error:  task.source,
 			}
 
 		case "torrent":

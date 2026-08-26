@@ -3,6 +3,7 @@ package vfs
 import (
 	"context"
 	"fmt"
+	"runtime"
 	"sync/atomic"
 
 	"github.com/puzpuzpuz/xsync/v4"
@@ -11,6 +12,14 @@ import (
 	"github.com/sirrobot01/decypharr/pkg/manager"
 	"github.com/sirrobot01/decypharr/pkg/mount/dfs/config"
 )
+
+// maxGetFileClaimedRetries bounds how many times getFile retries the whole
+// lookup after losing a race to a concurrent claim-for-teardown. Cache.GetItem
+// already blocks internally until a claimed item finishes tearing down, so
+// this only covers the narrow window between GetItem returning an item and
+// this file's own Open() call — a handful of attempts is enough to fail
+// loudly instead of retrying forever if something is stuck.
+const maxGetFileClaimedRetries = 8
 
 // Manager manages VFS lifecycle
 type Manager struct {
@@ -81,73 +90,99 @@ func (m *Manager) GetFile(info *manager.FileInfo) (*StreamingFile, error) {
 func (m *Manager) getFile(parent, name string, size int64) (*StreamingFile, error) {
 	key := buildFileKey(parent, name)
 
-	// Fast path: existing file.
-	// Increment refCount first, then verify the entry wasn't concurrently deleted
-	// by ReleaseFile between our Load and the Add. If it was, undo the increment
-	// and fall through to the slow path which will create a fresh entry.
-	if entry, ok := m.files.Load(key); ok {
-		entry.refCount.Add(1)
-		if !entry.deleted.Load() {
-			sf, err := NewStreamingFile(entry.item)
+	// The whole lookup is retried, not just the final Open(), because losing
+	// to a claim can happen at more than one point below (see the two
+	// retriable branches) and each needs to re-run from the top: a claimed
+	// entry evicted from m.files, or a cache item claimed between GetItem
+	// returning it and Open() here, both require re-resolving the fast path
+	// and possibly calling GetItem again to land on a genuinely fresh item.
+	for attempt := 0; attempt < maxGetFileClaimedRetries; attempt++ {
+		// Fast path: existing file.
+		// Increment refCount first, then verify the entry wasn't concurrently deleted
+		// by ReleaseFile between our Load and the Add. If it was, undo the increment
+		// and fall through to the slow path which will create a fresh entry.
+		if entry, ok := m.files.Load(key); ok {
+			entry.refCount.Add(1)
+			if !entry.deleted.Load() {
+				sf, err := NewStreamingFile(entry.item)
+				if err == nil {
+					return sf, nil
+				}
+				// Item was claimed for teardown between our Load and Open. The
+				// underlying CacheItem is being replaced (see Cache.GetItem), but
+				// this fileEntry itself is not: it stays in m.files, still
+				// pointing at the claimed item, until ReleaseFile eventually runs
+				// for whichever handle is still holding it open. If we simply
+				// fell through, the slow path's LoadOrStore below would find this
+				// same stale entry and retry against the same claimed item
+				// forever (EIO for every GetFile on this path until that
+				// unrelated ReleaseFile call happens to land). Evict the stale
+				// entry now — conditioned on it still being the exact entry we
+				// failed against, so we don't clobber one a concurrent slow path
+				// already replaced it with — so the slow path below creates and
+				// stores a genuinely fresh entry instead.
+				m.files.Compute(key, func(oldValue *fileEntry, loaded bool) (*fileEntry, xsync.ComputeOp) {
+					if loaded && oldValue == entry {
+						return nil, xsync.DeleteOp
+					}
+					return oldValue, xsync.CancelOp
+				})
+			}
+			entry.refCount.Add(-1)
+		}
+
+		// Get or create cache item. GetItem blocks internally until any claim
+		// on this key resolves, so it never hands back an item that's
+		// already claimed — only a genuinely fresh or already-open one.
+		item, err := m.cache.GetItem(parent, name, size)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get cache item: %w", err)
+		}
+
+		entry := &fileEntry{item: item}
+		entry.refCount.Store(1)
+
+		// Store or return existing
+		actual, loaded := m.files.LoadOrStore(key, entry)
+		if loaded {
+			// Another goroutine created it first
+			actual.refCount.Add(1)
+			sf, err := NewStreamingFile(actual.item)
 			if err == nil {
 				return sf, nil
 			}
-			// Item was claimed for teardown between our Load and Open. The
-			// underlying CacheItem is being replaced (see Cache.GetItem), but
-			// this fileEntry itself is not: it stays in m.files, still
-			// pointing at the claimed item, until ReleaseFile eventually runs
-			// for whichever handle is still holding it open. If we simply
-			// fell through, the slow path's LoadOrStore below would find this
-			// same stale entry and retry against the same claimed item
-			// forever (EIO for every GetFile on this path until that
-			// unrelated ReleaseFile call happens to land). Evict the stale
-			// entry now — conditioned on it still being the exact entry we
-			// failed against, so we don't clobber one a concurrent slow path
-			// already replaced it with — so the slow path below creates and
-			// stores a genuinely fresh entry instead.
-			m.files.Compute(key, func(oldValue *fileEntry, loaded bool) (*fileEntry, xsync.ComputeOp) {
-				if loaded && oldValue == entry {
-					return nil, xsync.DeleteOp
-				}
-				return oldValue, xsync.CancelOp
-			})
-		}
-		entry.refCount.Add(-1)
-	}
-
-	// Get or create cache item
-	item, err := m.cache.GetItem(parent, name, size)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get cache item: %w", err)
-	}
-
-	entry := &fileEntry{item: item}
-	entry.refCount.Store(1)
-
-	// Store or return existing
-	actual, loaded := m.files.LoadOrStore(key, entry)
-	if loaded {
-		// Another goroutine created it first
-		actual.refCount.Add(1)
-		sf, err := NewStreamingFile(actual.item)
-		if err != nil {
+			// actual was claimed between the racing goroutine storing it and
+			// us opening it here — narrow, but real (mirrors the fast-path
+			// case above). Retry from the top instead of failing a request
+			// whose only problem is timing.
 			actual.refCount.Add(-1)
-			return nil, fmt.Errorf("failed to open cache item: %w", err)
+			runtime.Gosched()
+			continue
 		}
-		return sf, nil
-	}
 
-	m.totalFiles.Add(1)
-	m.activeFiles.Add(1)
-	sf, err := NewStreamingFile(item)
-	if err != nil {
-		// item was just created by us via GetItem above and stored in
-		// entry — it cannot already be claimed. Treat as unexpected.
+		m.totalFiles.Add(1)
+		m.activeFiles.Add(1)
+		sf, err := NewStreamingFile(item)
+		if err == nil {
+			return sf, nil
+		}
+		// item was just created by us via GetItem above and stored in entry,
+		// but a forced purge (e.g. Cache.evict's Windows forced-close path)
+		// can still claim it in the gap between GetItem returning and Open()
+		// here. Undo the bookkeeping, drop the now-dead entry so the next
+		// attempt's fast path doesn't trip over it, and retry.
 		m.totalFiles.Add(-1)
 		m.activeFiles.Add(-1)
-		return nil, fmt.Errorf("failed to open cache item: %w", err)
+		m.files.Compute(key, func(oldValue *fileEntry, loaded bool) (*fileEntry, xsync.ComputeOp) {
+			if loaded && oldValue == entry {
+				return nil, xsync.DeleteOp
+			}
+			return oldValue, xsync.CancelOp
+		})
+		runtime.Gosched()
 	}
-	return sf, nil
+
+	return nil, fmt.Errorf("getFile: exceeded retry budget waiting for claimed item %q", key)
 }
 
 // ReleaseFile decrements the reference count

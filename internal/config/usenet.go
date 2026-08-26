@@ -32,7 +32,13 @@ type UsenetProvider struct {
 	Backbone       string `json:"backbone,omitempty"`        // Shared article backbone identifier used for failover decisions
 	MaxConnections int    `json:"max_connections,omitempty"` // Max connections for this provider (default: 10)
 	SSL            bool   `json:"ssl,omitempty"`             // Use SSL/TLS for the connection
-	Priority       int    `json:"priority,omitempty"`        // Priority for this provider (lower = higher priority)
+	// MinIdleConnections keeps this many idle connections pre-dialed and
+	// pooled at all times, so the first file open of a session (or any open
+	// after the pool has gone fully idle) doesn't pay a fresh TCP+TLS+AUTH
+	// handshake before the first byte can be requested. Default 0 (off) -
+	// purely reactive dialing, matching prior behavior.
+	MinIdleConnections int `json:"min_idle_connections,omitempty"`
+	Priority           int `json:"priority,omitempty"` // Priority for this provider (lower = higher priority)
 	// Backup marks this provider as a fallback tier. Backups are only
 	// consulted when every non-backup ("primary") provider is excluded
 	// — e.g. all primaries returned article-not-found or had connection
@@ -42,6 +48,13 @@ type UsenetProvider struct {
 	// other Usenet clients implement, and prevents block providers from
 	// being billed for articles the unlimited could have served.
 	Backup bool `json:"backup,omitempty"`
+
+	// SubscriptionExpiry/AutoRenew are informational only - purely for
+	// surfacing subscription status in Settings/Stats so users can keep
+	// track of when a provider's plan runs out. Never read by any
+	// connection/download logic.
+	SubscriptionExpiry string `json:"subscription_expiry,omitempty"` // Optional plan end date, e.g. "2026-12-31"
+	AutoRenew          bool   `json:"auto_renew,omitempty"`          // Whether the subscription is set to auto-renew
 }
 
 // Usenet configuration for usenet streaming and downloading
@@ -52,6 +65,10 @@ type Usenet struct {
 	ProcessingMaxConnections int `json:"processing_max_connections,omitempty"` // Maximum concurrent connections per file for parsing and NZB downloads (default: max_connections)
 	// Read-ahead configuration
 	ReadAhead string `json:"read_ahead,omitempty"` // Bytes to prefetch ahead of streaming reads e.g. "16MB", "32MB" (default: 16MB)
+	// PrefetchAheadSegments is how many segments beyond the requested range
+	// the streaming reader queues for read-ahead. Default 0 -> 8 (prior
+	// hardcoded value).
+	PrefetchAheadSegments int `json:"prefetch_ahead_segments,omitempty"`
 	// SocketReadBuffer / SocketWriteBuffer set the per-connection TCP
 	// SO_RCVBUF / SO_SNDBUF (e.g. "4MB"). At high RTT a single connection's
 	// throughput is capped at roughly buffer ÷ RTT, so the receive buffer must
@@ -63,6 +80,11 @@ type Usenet struct {
 	SocketWriteBuffer string `json:"socket_write_buffer,omitempty"`
 	// Processing timeout
 	ProcessingTimeout string `json:"processing_timeout,omitempty"` // Timeout for NZB processing e.g. "5m", "10m" (default: 10m). Mark as bad if exceeded.
+	// ConnIdleTimeout is how long an unused pooled NNTP connection is kept
+	// warm (and keepalive-pinged) before being closed, e.g. "5m". Players
+	// read in bursts with quiet gaps; closing too early forces a
+	// TCP+TLS+AUTH reconnect storm on every resume. Default: 5m.
+	ConnIdleTimeout string `json:"conn_idle_timeout,omitempty"`
 	// Availability check sampling
 	AvailabilitySamplePercent       int    `json:"availability_sample_percent,omitempty"`        // Percentage of segments to check during repair (1-100, default: 10)
 	ImportAvailabilitySamplePercent int    `json:"import_availability_sample_percent,omitempty"` // Percentage of segments to check when adding an NZB (1-100, default: 1)
