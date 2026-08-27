@@ -3,9 +3,20 @@ package manager
 import (
 	"testing"
 
+	"github.com/puzpuzpuz/xsync/v4"
 	"github.com/sirrobot01/decypharr/internal/config"
+	debrid "github.com/sirrobot01/decypharr/pkg/debrid/common"
 	"github.com/sirrobot01/decypharr/pkg/storage"
 )
+
+// newTestManager builds a Manager suitable for exercising deleteGhostEntries
+// in tests. clients must be a real xsync.Map (its zero value is an
+// unusable nil pointer, unlike stdlib sync.Map) since Case 1's cleanup path
+// calls ProviderClient() -> m.clients.Load(...) even when no provider is
+// configured for the deleted entry.
+func newTestManager(store *storage.Storage) *Manager {
+	return &Manager{storage: store, clients: xsync.NewMap[string, debrid.Client]()}
+}
 
 // TestDeleteGhostEntries_DoesNotDeleteSoleCopyWhenNoRenamedCopyExists is a
 // regression test: an Entry record can end up with Name != OriginalFilename
@@ -56,7 +67,7 @@ func TestDeleteGhostEntries_DoesNotDeleteSoleCopyWhenNoRenamedCopyExists(t *test
 		t.Fatalf("setup failed: raw-name EntryItem should exist before cleanup: %v", err)
 	}
 
-	mgr := &Manager{storage: store}
+	mgr := newTestManager(store)
 	mgr.deleteGhostEntries()
 
 	if _, err := store.GetEntryItem("raw.release.name.mkv"); err != nil {
@@ -100,7 +111,7 @@ func TestDeleteGhostEntries_DeletesRawCopyWhenRenamedCopyGenuinelyExists(t *test
 		t.Fatal(err)
 	}
 
-	mgr := &Manager{storage: store}
+	mgr := newTestManager(store)
 	mgr.deleteGhostEntries()
 
 	if _, err := store.GetEntryItem("raw.release.name2.mkv"); err == nil {
@@ -108,5 +119,56 @@ func TestDeleteGhostEntries_DeletesRawCopyWhenRenamedCopyGenuinelyExists(t *test
 	}
 	if _, err := store.GetEntryItem(entry.GetFolder()); err != nil {
 		t.Fatalf("renamed EntryItem must survive: %v", err)
+	}
+}
+
+// TestDeleteGhostEntries_Case1DeletesRawEntryForNzbProtocol confirms Case 1
+// (an EntryItem folder whose files span two distinct Entry hashes — one
+// CLI-renamed, one still raw — where the raw one is a ghost duplicate of the
+// renamed one) applies to nzb entries too, not just torrent. Both protocols
+// share the same Entry/EntryItem model and the same CLI rename convention
+// ("{imdb-...}" tagging), so the same staleness pattern occurs on either.
+func TestDeleteGhostEntries_Case1DeletesRawEntryForNzbProtocol(t *testing.T) {
+	store, err := storage.NewStorage(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	renamed := &storage.Entry{
+		Protocol: config.ProtocolNZB, InfoHash: "hash-renamed",
+		Name: "Show (2020) - S01E01 - {imdb-tt1234567} - 1080p", OriginalFilename: "raw.release.name.mkv",
+	}
+	if err := store.AddOrUpdate(renamed); err != nil {
+		t.Fatal(err)
+	}
+	raw := &storage.Entry{
+		Protocol: config.ProtocolNZB, InfoHash: "hash-raw",
+		Name: "raw.release.name.mkv", OriginalFilename: "raw.release.name.mkv",
+	}
+	if err := store.AddOrUpdate(raw); err != nil {
+		t.Fatal(err)
+	}
+
+	// A shared EntryItem folder whose files span both hashes — the scenario
+	// Case 1 looks for.
+	if err := store.UpdateItem(&storage.EntryItem{
+		Name: "shared-folder",
+		Files: map[string]*storage.File{
+			"file-a.mkv": {Name: "file-a.mkv", InfoHash: "hash-renamed"},
+			"file-b.mkv": {Name: "file-b.mkv", InfoHash: "hash-raw"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	mgr := newTestManager(store)
+	mgr.deleteGhostEntries()
+
+	if _, err := store.Get("hash-raw"); err == nil {
+		t.Fatal("raw duplicate nzb Entry should have been deleted as a ghost of the renamed one")
+	}
+	if _, err := store.Get("hash-renamed"); err != nil {
+		t.Fatalf("renamed nzb Entry must survive: %v", err)
 	}
 }

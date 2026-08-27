@@ -710,8 +710,12 @@ func (m *Manager) clearBadFlagsForHealthyTorrents() {
 	}
 }
 
-// deleteGhostEntries removes ghost torrent entries — raw-RD-named duplicates of
-// CLI-renamed entries. Two cases handled:
+// deleteGhostEntries removes ghost entries — raw-named duplicates of
+// CLI-renamed entries. Applies to both torrent and nzb entries: both share
+// the same Entry/EntryItem model and the same CLI rename flow (an nzb entry's
+// CLI-renamed Name follows the identical "{imdb-...}" tagging convention a
+// torrent entry's does), so the same staleness pattern occurs on either
+// protocol. Two cases handled:
 //
 //  1. Entries sharing the same EntryItem folder name where one is CLI-renamed
 //     and the other is not (same content, different folder name format).
@@ -725,7 +729,7 @@ func (m *Manager) clearBadFlagsForHealthyTorrents() {
 //     misidentify distinct, valid torrents as "ghosts" of each other and delete
 //     them from the debrid provider. Do not reintroduce a size-only match here;
 //     any replacement must key off info-hash or another value that is actually
-//     unique per torrent.
+//     unique per entry.
 func (m *Manager) deleteGhostEntries() {
 	deleted := 0
 
@@ -751,7 +755,7 @@ func (m *Manager) deleteGhostEntries() {
 		var candidates []entryScore
 		for hash := range hashSet {
 			e, err := m.storage.Get(hash)
-			if err != nil || e == nil || e.Protocol != "torrent" {
+			if err != nil || e == nil {
 				continue
 			}
 			hasRenamed := e.Name != "" && e.OriginalFilename != "" && e.Name != e.OriginalFilename
@@ -776,7 +780,7 @@ func (m *Manager) deleteGhostEntries() {
 			if c.entry.InfoHash == primary.InfoHash || c.hasRenamed {
 				continue
 			}
-			m.deleteEntryAndRDTorrent(c.entry, &deleted)
+			m.deleteGhostEntryFromProvider(c.entry, &deleted)
 		}
 		return nil
 	})
@@ -858,20 +862,21 @@ func (m *Manager) deleteGhostEntries() {
 	})
 
 	if deleted > 0 {
-		m.logger.Info().Int("deleted", deleted).Msg("Deleted ghost torrent entries on startup")
+		m.logger.Info().Int("deleted", deleted).Msg("Deleted ghost entries on startup")
 	}
 }
 
-// deleteEntryAndRDTorrent deletes a ghost entry from RD and Decypharr storage.
-func (m *Manager) deleteEntryAndRDTorrent(e *storage.Entry, count *int) {
+// deleteGhostEntryFromProvider deletes a ghost entry from its active provider
+// (whichever debrid or usenet client owns it) and from Decypharr storage.
+func (m *Manager) deleteGhostEntryFromProvider(e *storage.Entry, count *int) {
 	client := m.ProviderClient(e.ActiveProvider)
 	if client != nil {
 		placement := e.GetActiveProvider()
 		if placement != nil && placement.ID != "" {
 			if err := client.DeleteTorrent(placement.ID); err != nil {
-				m.logger.Debug().Err(err).Str("name", e.Name).Msg("Failed to delete ghost torrent from RD")
+				m.logger.Debug().Err(err).Str("name", e.Name).Msg("Failed to delete ghost entry from provider")
 			} else {
-				m.logger.Info().Str("name", e.Name).Str("infohash", e.InfoHash).Msg("Deleted ghost torrent from RD")
+				m.logger.Info().Str("name", e.Name).Str("infohash", e.InfoHash).Msg("Deleted ghost entry from provider")
 			}
 		}
 	}
