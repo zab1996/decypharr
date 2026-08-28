@@ -938,8 +938,12 @@ func (m *Manager) DeleteEntry(infohash string, removePlacements bool) error {
 	// completed jobs as ghosts in queue.db (ffprobe reject, repair teardown,
 	// manual browse delete, etc.). Best-effort queue cleanup here keeps both
 	// stores aligned.
-	if err := m.queue.DeleteEntryOnly(infohash); err != nil {
-		m.logger.Debug().Err(err).Str("infohash", infohash).Msg("Queue entry already absent after storage delete")
+	if _, err := m.queue.GetTorrent(infohash); err == nil {
+		if err := m.queue.DeleteEntryOnly(infohash); err != nil {
+			m.logger.Warn().Err(err).Str("infohash", infohash).Str("name", torr.Name).Msg("Failed to remove queue entry after storage delete")
+		} else {
+			m.logger.Info().Str("infohash", infohash).Str("name", torr.Name).Msg("Removed queue entry after storage delete")
+		}
 	}
 
 	// Clean up NZB metadata so WebDAV stops serving the file path after deletion
