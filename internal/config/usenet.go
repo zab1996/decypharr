@@ -69,6 +69,11 @@ type Usenet struct {
 	// the streaming reader queues for read-ahead. Default 0 -> 8 (prior
 	// hardcoded value).
 	PrefetchAheadSegments int `json:"prefetch_ahead_segments,omitempty"`
+	// PreCacheOnOpen pre-fetches the head and tail of a Usenet file whenever
+	// the mount receives an open. Keep this opt-in: library scanners can open
+	// many newly-added episodes at once and otherwise compete with playback
+	// for the shared NNTP connection pool.
+	PreCacheOnOpen bool `json:"pre_cache_on_open,omitempty"`
 	// SocketReadBuffer / SocketWriteBuffer set the per-connection TCP
 	// SO_RCVBUF / SO_SNDBUF (e.g. "4MB"). At high RTT a single connection's
 	// throughput is capped at roughly buffer ÷ RTT, so the receive buffer must
@@ -115,7 +120,7 @@ func (u Usenet) BufferMemoryBytes() int64 {
 }
 
 func (u Usenet) IsZero() bool {
-	return len(u.Providers) == 0 && u.MaxConnections == 0 && u.ProcessingMaxConnections == 0 && u.ReadAhead == "" && u.ProcessingTimeout == ""
+	return len(u.Providers) == 0 && u.MaxConnections == 0 && u.ProcessingMaxConnections == 0 && u.ReadAhead == "" && u.ProcessingTimeout == "" && !u.PreCacheOnOpen
 }
 
 func (c *Config) updateUsenetConfig() {
@@ -227,6 +232,9 @@ func (c *Config) applyUsenetEnvVars() {
 
 	if readAhead := getEnv("USENET__READ_AHEAD"); readAhead != "" {
 		c.Usenet.ReadAhead = readAhead
+	}
+	if preCacheOnOpen := getEnv("USENET__PRE_CACHE_ON_OPEN"); preCacheOnOpen != "" {
+		c.Usenet.PreCacheOnOpen = parseBool(preCacheOnOpen)
 	}
 
 	if v := getEnv("USENET__SOCKET_READ_BUFFER"); v != "" {

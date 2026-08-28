@@ -116,6 +116,7 @@ Array of Debrid services:
     "max_connections": 15,
     "processing_max_connections": 15,
     "read_ahead": "16MB",
+    "pre_cache_on_open": false,
     "processing_timeout": "10m",
     "availability_sample_percent": 10,
     "import_availability_sample_percent": 1,
@@ -132,6 +133,7 @@ Array of Debrid services:
 | `max_connections`             | int    | Max connections per streaming file | `15`                      |
 | `processing_max_connections`  | int    | Max connections per file for parsing and NZB downloads | Same as `max_connections` |
 | `read_ahead`                  | string | Prefetch buffer size            | `16MB`                       |
+| `pre_cache_on_open`           | bool   | Fetch the head and tail when a Usenet file is opened; enabling this can add NNTP load during library scans | `false` |
 | `processing_timeout`          | string | Max time for NZB processing     | `10m`                        |
 | `availability_sample_percent` | int    | % of segments to check during repairs (1-100) | `10`             |
 | `import_availability_sample_percent` | int | % of segments to check when adding an NZB (1-100) | `1`         |
@@ -386,6 +388,7 @@ DEBRIDS__0__API_KEY=your_key
 
 # Usenet
 USENET__MAX_CONNECTIONS=20
+USENET__PRE_CACHE_ON_OPEN=false
 USENET__PROVIDERS__0__HOST=news.provider.com
 USENET__PROVIDERS__0__PORT=563
 USENET__PROVIDERS__0__BACKBONE=Omicron

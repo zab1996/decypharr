@@ -418,6 +418,15 @@
                                                 <span class="text-sm opacity-70">Amount of data to read ahead when streaming
                                                     (default: 16MB)</span>
                                             </div>
+                                            <div class="flex items-center gap-3">
+                                                <input type="checkbox" class="checkbox checkbox-warning"
+                                                       name="usenet.pre_cache_on_open"
+                                                       id="usenet.pre_cache_on_open">
+                                                <label class="label cursor-pointer block" for="usenet.pre_cache_on_open">
+                                                    <span class="font-medium">Pre-cache Usenet Files on Open</span>
+                                                    <span class="text-sm opacity-70 block">Fetch the file head and tail when opened. Disabled by default to prevent library scans from competing with playback.</span>
+                                                </label>
+                                            </div>
                                             <div>
                                                 <label class="label" for="usenet.processing_timeout">
                                                     <span class="font-medium">Processing Timeout</span>

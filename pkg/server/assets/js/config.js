@@ -1296,6 +1296,7 @@ class ConfigManager {
                 || parseInt(document.querySelector('[name="usenet.max_connections"]')?.value)
                 || 15,
             read_ahead: document.querySelector('[name="usenet.read_ahead"]').value || "16MB",
+            pre_cache_on_open: document.querySelector('[name="usenet.pre_cache_on_open"]')?.checked || false,
             processing_timeout: document.querySelector('[name="usenet.processing_timeout"]')?.value || "5m",
             conn_idle_timeout: document.querySelector('[name="usenet.conn_idle_timeout"]')?.value || "",
             availability_sample_percent: parseInt(document.querySelector('[name="usenet.availability_sample_percent"]')?.value) || 10,
@@ -1832,6 +1833,7 @@ class ConfigManager {
             'max_connections': usenet.max_connections,
             'processing_max_connections': usenet.processing_max_connections,
             'read_ahead': usenet.read_ahead,
+            'pre_cache_on_open': usenet.pre_cache_on_open,
             'processing_timeout': usenet.processing_timeout,
             'conn_idle_timeout': usenet.conn_idle_timeout,
             'availability_sample_percent': usenet.availability_sample_percent,
@@ -1844,7 +1846,11 @@ class ConfigManager {
         Object.entries(streamFields).forEach(([id, value]) => {
             const input = document.getElementsByName(`usenet.${id}`)[0];
             if (input && value !== undefined) {
-                input.value = value;
+                if (input.type === 'checkbox') {
+                    input.checked = Boolean(value);
+                } else {
+                    input.value = value;
+                }
             }
         });
     }
