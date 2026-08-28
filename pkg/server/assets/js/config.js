@@ -107,6 +107,7 @@ class ConfigManager {
             }
 
             const config = await response.json();
+            this.loadedUsenet = config.usenet || {};
             this.populateForm(config);
 
         } catch (error) {
@@ -1307,6 +1308,14 @@ class ConfigManager {
             }
         });
 
+        const savedUsenet = this.loadedUsenet || {};
+        const reserveEnabledEl = document.querySelector('[name="usenet.interactive_pool_reserve_enabled"]');
+        const perStreamEl = document.querySelector('[name="usenet.interactive_pool_reserve_per_stream"]');
+        const percentEl = document.querySelector('[name="usenet.interactive_pool_reserve_percent"]');
+        const minEl = document.querySelector('[name="usenet.interactive_pool_reserve_min"]');
+        const maxEl = document.querySelector('[name="usenet.interactive_pool_reserve_max"]');
+        const preCacheEl = document.querySelector('[name="usenet.pre_cache_on_open"]');
+
         return {
             providers: providers,
             max_connections: parseInt(document.querySelector('[name="usenet.max_connections"]')?.value) || 15,
@@ -1314,15 +1323,15 @@ class ConfigManager {
                 || parseInt(document.querySelector('[name="usenet.max_connections"]')?.value)
                 || 15,
             read_ahead: document.querySelector('[name="usenet.read_ahead"]').value || "16MB",
-            pre_cache_on_open: document.querySelector('[name="usenet.pre_cache_on_open"]')?.checked || false,
-            interactive_pool_reserve_enabled: document.querySelector('[name="usenet.interactive_pool_reserve_enabled"]')?.checked || false,
-            interactive_pool_reserve_per_stream: parseInt(document.querySelector('[name="usenet.interactive_pool_reserve_per_stream"]')?.value, 10) || 0,
-            interactive_pool_reserve_percent: parseInt(document.querySelector('[name="usenet.interactive_pool_reserve_percent"]')?.value) || 15,
-            interactive_pool_reserve_min: parseInt(document.querySelector('[name="usenet.interactive_pool_reserve_min"]')?.value) || 6,
-            interactive_pool_reserve_max: parseInt(document.querySelector('[name="usenet.interactive_pool_reserve_max"]')?.value) || 40,
-            interactive_detect_bytes: document.querySelector('[name="usenet.interactive_detect_bytes"]')?.value || "4MB",
-            interactive_detect_window: document.querySelector('[name="usenet.interactive_detect_window"]')?.value || "5s",
-            interactive_idle_timeout: document.querySelector('[name="usenet.interactive_idle_timeout"]')?.value || "30s",
+            pre_cache_on_open: preCacheEl ? preCacheEl.checked : (savedUsenet.pre_cache_on_open ?? false),
+            interactive_pool_reserve_enabled: reserveEnabledEl ? reserveEnabledEl.checked : (savedUsenet.interactive_pool_reserve_enabled ?? false),
+            interactive_pool_reserve_per_stream: perStreamEl ? (parseInt(perStreamEl.value, 10) || 0) : (savedUsenet.interactive_pool_reserve_per_stream ?? 0),
+            interactive_pool_reserve_percent: percentEl ? (parseInt(percentEl.value, 10) || 15) : (savedUsenet.interactive_pool_reserve_percent ?? 15),
+            interactive_pool_reserve_min: minEl ? (parseInt(minEl.value, 10) || 6) : (savedUsenet.interactive_pool_reserve_min ?? 6),
+            interactive_pool_reserve_max: maxEl ? (parseInt(maxEl.value, 10) || 40) : (savedUsenet.interactive_pool_reserve_max ?? 40),
+            interactive_detect_bytes: document.querySelector('[name="usenet.interactive_detect_bytes"]')?.value || savedUsenet.interactive_detect_bytes || "4MB",
+            interactive_detect_window: document.querySelector('[name="usenet.interactive_detect_window"]')?.value || savedUsenet.interactive_detect_window || "5s",
+            interactive_idle_timeout: document.querySelector('[name="usenet.interactive_idle_timeout"]')?.value || savedUsenet.interactive_idle_timeout || "30s",
             processing_timeout: document.querySelector('[name="usenet.processing_timeout"]')?.value || "5m",
             conn_idle_timeout: document.querySelector('[name="usenet.conn_idle_timeout"]')?.value || "",
             availability_sample_percent: parseInt(document.querySelector('[name="usenet.availability_sample_percent"]')?.value) || 10,

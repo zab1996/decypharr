@@ -80,6 +80,8 @@ type Manager struct {
 
 	interactive *InteractiveMonitor
 
+	plexProtection *plexProtectionState
+
 	// In-flight queue-processor dispatches, keyed by InfoHash, to prevent
 	// duplicate goroutines from processing the same entry when the scheduler
 	// re-fires before the previous pass has updated the queue row.
@@ -269,7 +271,11 @@ func (m *Manager) initLinkService() {
 }
 
 func (m *Manager) initJobQueue() {
-	m.jobQueue = NewJobQueue(m.ctx, m.config.MaxActiveDownloads, m.processJob)
+	m.jobQueue = NewJobQueue(m.ctx, m.config.MaxActiveDownloads, func(ctx context.Context, job *Job) {
+		m.NotifyBackgroundActivity()
+		defer m.NotifyBackgroundActivity()
+		m.processJob(ctx, job)
+	})
 	// Restoring a large active-download queue can take 60-90 minutes
 	// (re-parsing every in-flight NZB/torrent). Running it synchronously
 	// here blocked Manager construction — and therefore the HTTP server —
@@ -941,11 +947,13 @@ func (m *Manager) DeleteEntry(infohash string, removePlacements bool) error {
 	// completed jobs as ghosts in queue.db (ffprobe reject, repair teardown,
 	// manual browse delete, etc.). Best-effort queue cleanup here keeps both
 	// stores aligned.
-	if _, err := m.queue.GetTorrent(infohash); err == nil {
-		if err := m.queue.DeleteEntryOnly(infohash); err != nil {
-			m.logger.Warn().Err(err).Str("infohash", infohash).Str("name", torr.Name).Msg("Failed to remove queue entry after storage delete")
-		} else {
-			m.logger.Info().Str("infohash", infohash).Str("name", torr.Name).Msg("Removed queue entry after storage delete")
+	if m.queue != nil {
+		if _, err := m.queue.GetTorrent(infohash); err == nil {
+			if err := m.queue.DeleteEntryOnly(infohash); err != nil {
+				m.logger.Warn().Err(err).Str("infohash", infohash).Str("name", torr.Name).Msg("Failed to remove queue entry after storage delete")
+			} else {
+				m.logger.Info().Str("infohash", infohash).Str("name", torr.Name).Msg("Removed queue entry after storage delete")
+			}
 		}
 	}
 
@@ -985,5 +993,9 @@ func (m *Manager) SubmitJob(job *Job) error {
 	if m.jobQueue == nil {
 		return fmt.Errorf("active download queue not initialized")
 	}
-	return m.jobQueue.Submit(job)
+	if err := m.jobQueue.Submit(job); err != nil {
+		return err
+	}
+	m.NotifyBackgroundActivity()
+	return nil
 }

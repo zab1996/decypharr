@@ -30,7 +30,8 @@ type InteractiveMonitor struct {
 
 	active bool
 
-	onChange func(active bool, meta reserveStreamMeta, activeStreams int, bytesInWindow int64, detectWindow time.Duration)
+	onChange       func(active bool, meta reserveStreamMeta, activeStreams int, bytesInWindow int64, detectWindow time.Duration)
+	shouldActivate func() bool
 }
 
 type reserveStreamMeta struct {
@@ -39,8 +40,11 @@ type reserveStreamMeta struct {
 	Client string
 }
 
-func newInteractiveMonitor(cfg *config.Config, onChange func(bool, reserveStreamMeta, int, int64, time.Duration)) *InteractiveMonitor {
-	m := &InteractiveMonitor{onChange: onChange}
+func newInteractiveMonitor(cfg *config.Config, onChange func(bool, reserveStreamMeta, int, int64, time.Duration), shouldActivate func() bool) *InteractiveMonitor {
+	m := &InteractiveMonitor{onChange: onChange, shouldActivate: shouldActivate}
+	if m.shouldActivate == nil {
+		m.shouldActivate = func() bool { return true }
+	}
 	m.applyConfig(cfg)
 	return m
 }
@@ -75,14 +79,35 @@ func (m *InteractiveMonitor) applyConfig(cfg *config.Config) {
 	}
 }
 
-// RecordRead records new bytes for activation and total bytes for idle keepalive.
-func (m *InteractiveMonitor) RecordRead(newBytes, totalBytes int64, probe bool, meta reserveStreamMeta) {
+// forceDeactivate ends reserve mode immediately (e.g. Plex poll failure).
+func (m *InteractiveMonitor) forceDeactivate() {
 	if m == nil {
 		return
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if !m.enabled || probe {
+	if !m.active {
+		return
+	}
+	m.active = false
+	m.samples = nil
+	if m.onChange != nil {
+		meta := m.lastMeta
+		window := m.detectWindow
+		m.mu.Unlock()
+		m.onChange(false, meta, 0, 0, window)
+		m.mu.Lock()
+	}
+}
+
+// RecordRead records new bytes for activation and total bytes for idle keepalive.
+func (m *InteractiveMonitor) RecordRead(newBytes, totalBytes int64, probe bool, meta reserveStreamMeta, protected bool) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.enabled || probe || !protected {
 		return
 	}
 	now := time.Now()
@@ -104,6 +129,13 @@ func (m *InteractiveMonitor) Tick(now time.Time) {
 	if m == nil {
 		return
 	}
+	m.evaluateNow(now)
+}
+
+func (m *InteractiveMonitor) evaluateNow(now time.Time) {
+	if m == nil {
+		return
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if !m.enabled {
@@ -111,16 +143,29 @@ func (m *InteractiveMonitor) Tick(now time.Time) {
 	}
 	m.pruneLocked(now)
 	if m.active {
-		if !m.lastQualifyingAt.IsZero() && now.Sub(m.lastQualifyingAt) >= m.idleTimeout {
-			m.active = false
-			m.samples = nil
-			if m.onChange != nil {
-				meta := m.lastMeta
-				m.mu.Unlock()
-				m.onChange(false, meta, 0, 0, m.detectWindow)
-				m.mu.Lock()
-			}
+		if m.shouldActivate != nil && !m.shouldActivate() {
+			m.deactivateLocked()
+			return
 		}
+		if !m.lastQualifyingAt.IsZero() && now.Sub(m.lastQualifyingAt) >= m.idleTimeout {
+			m.deactivateLocked()
+		}
+		return
+	}
+	m.evaluateLocked(now)
+}
+
+func (m *InteractiveMonitor) deactivateLocked() {
+	if !m.active {
+		return
+	}
+	m.active = false
+	if m.onChange != nil {
+		meta := m.lastMeta
+		window := m.detectWindow
+		m.mu.Unlock()
+		m.onChange(false, meta, 0, 0, window)
+		m.mu.Lock()
 	}
 }
 
@@ -145,6 +190,9 @@ func (m *InteractiveMonitor) evaluateLocked(now time.Time) {
 		total += s.bytes
 	}
 	if total < m.detectBytes {
+		return
+	}
+	if m.shouldActivate != nil && !m.shouldActivate() {
 		return
 	}
 	m.active = true
@@ -174,6 +222,7 @@ func (m *Manager) RecordStreamActivity(streamID string, totalBytes, newBytes int
 		return
 	}
 	var meta reserveStreamMeta
+	protected := false
 	if streamID != "" {
 		if s, ok := m.activeStreams.Load(streamID); ok && s != nil {
 			s.LastActive = utils.NowUnix()
@@ -181,7 +230,18 @@ func (m *Manager) RecordStreamActivity(streamID string, totalBytes, newBytes int
 			meta = reserveStreamMeta{Entry: s.EntryName, File: s.FileName, Client: s.Client}
 		}
 	}
-	m.interactive.RecordRead(newBytes, totalBytes, probe, meta)
+	if m.interactiveProtectionEnabled() {
+		if !m.plexCredentialsConfigured() {
+			return
+		}
+		protected = m.IsStreamProtected(streamID)
+		if !protected {
+			return
+		}
+	} else {
+		protected = true
+	}
+	m.interactive.RecordRead(newBytes, totalBytes, probe, meta, protected)
 	if m.interactive.Active() {
 		m.pushInteractiveStreamCount()
 	}
@@ -190,6 +250,16 @@ func (m *Manager) RecordStreamActivity(streamID string, totalBytes, newBytes int
 func (m *Manager) countQualifyingStreams() int {
 	if m == nil {
 		return 0
+	}
+	if m.interactiveProtectionEnabled() {
+		if !m.plexCredentialsConfigured() || !m.PlexProtectionAvailable() {
+			return 0
+		}
+		count := m.PlexProtectedStreamCount()
+		if count == 0 {
+			return 0
+		}
+		return count
 	}
 	idle := 30 * time.Second
 	if cfg := config.Get(); cfg != nil {
@@ -233,7 +303,7 @@ func (m *Manager) startInteractiveMonitor(cfg *config.Config) {
 			}
 			m.usenet.SetInteractiveReserveActive(active, meta.Entry, meta.File, meta.Client, activeStreams, bytesInWindow, detectWindow)
 		}
-	})
+	}, m.hasBackgroundContention)
 	go m.interactiveMonitorLoop()
 }
 
@@ -271,4 +341,27 @@ func (m *Manager) ReconfigureInteractiveMonitor(cfg *config.Config) {
 // NotifyInteractiveStreamCount pushes the current active stream count to NNTP reserve.
 func (m *Manager) NotifyInteractiveStreamCount() {
 	m.pushInteractiveStreamCount()
+}
+
+func (m *Manager) hasBackgroundContention() bool {
+	if m == nil {
+		return false
+	}
+	if m.jobQueue != nil {
+		if m.jobQueue.ActiveCount() > 0 || m.jobQueue.Len() > 0 {
+			return true
+		}
+	}
+	return m.processingEntries != nil && m.processingEntries.Size() > 0
+}
+
+// NotifyBackgroundActivity re-evaluates reserve when import/parse work starts or stops.
+func (m *Manager) NotifyBackgroundActivity() {
+	if m == nil || m.interactive == nil {
+		return
+	}
+	m.interactive.evaluateNow(time.Now())
+	if m.interactive.Active() {
+		m.pushInteractiveStreamCount()
+	}
 }

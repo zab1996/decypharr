@@ -168,10 +168,11 @@ func (m *Manager) UsenetStats() map[string]interface{} {
 	if m.usenet == nil {
 		return nil
 	}
-	stats := m.usenet.Stats()
+    stats := m.usenet.Stats()
 	contentSize, contentCount := m.storage.NZBContentStats()
 	stats["content_size"] = contentSize
 	stats["content_count"] = contentCount
+	stats["plex_protection"] = m.PlexProtectionStats()
 	return stats
 }
 
