@@ -829,6 +829,7 @@ func (u *Usenet) preStreamChecks(file *storage.NZBFile) error {
 
 // Stream streams a file using the new streaming system with caching and worker limiting
 func (u *Usenet) Stream(ctx context.Context, nzoID, filename string, start, end int64, writer io.Writer) error {
+	ctx = nntp.WithWorkClass(ctx, nntp.WorkClassStream)
 	if start < 0 {
 		start = 0
 	}

@@ -100,6 +100,20 @@ func TestWorkClassFromContext(t *testing.T) {
 	}
 }
 
+func TestWorkClassIsExplicitlyBackground(t *testing.T) {
+	if WorkClassIsExplicitlyBackground(context.Background()) {
+		t.Fatal("untagged context must not count as explicitly background")
+	}
+	bg := WithWorkClass(context.Background(), WorkClassBackground)
+	if !WorkClassIsExplicitlyBackground(bg) {
+		t.Fatal("tagged background context must be explicitly background")
+	}
+	stream := WithWorkClass(context.Background(), WorkClassStream)
+	if WorkClassIsExplicitlyBackground(stream) {
+		t.Fatal("stream context must not be explicitly background")
+	}
+}
+
 func TestRepairPoolInteractiveCap(t *testing.T) {
 	p := &RepairPool{workers: 20}
 	p.setInteractiveCap(8)

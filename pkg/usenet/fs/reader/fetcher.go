@@ -202,7 +202,7 @@ func (sf *SegmentFetcher) doFetch(ctx context.Context, segIdx int) error {
 	downloadCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	class := nntp.WorkClassStream
-	if nntp.WorkClassFromContext(ctx) == nntp.WorkClassBackground {
+	if nntp.WorkClassIsExplicitlyBackground(ctx) {
 		class = nntp.WorkClassBackground
 	}
 	downloadCtx = nntp.WithWorkClass(downloadCtx, class)
@@ -360,7 +360,7 @@ func (sf *SegmentFetcher) prefetchOne(segIdx int) {
 		return
 	}
 
-	fetchCtx, cancel := context.WithTimeout(sf.ctx, sf.config.DownloadTimeout)
+	fetchCtx, cancel := context.WithTimeout(nntp.WithWorkClass(sf.ctx, nntp.WorkClassBackground), sf.config.DownloadTimeout)
 	err := sf.Fetch(fetchCtx, segIdx)
 	cancel()
 

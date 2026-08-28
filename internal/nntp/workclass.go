@@ -27,3 +27,11 @@ func WorkClassFromContext(ctx context.Context) WorkClass {
 	}
 	return WorkClassBackground
 }
+
+// WorkClassIsExplicitlyBackground reports whether ctx was tagged as background work.
+// Untagged contexts are not treated as background for pool classification.
+func WorkClassIsExplicitlyBackground(ctx context.Context) bool {
+	return WorkClassFromContext(ctx) == WorkClassBackground &&
+		ctx != nil &&
+		ctx.Value(workClassKey{}) != nil
+}
