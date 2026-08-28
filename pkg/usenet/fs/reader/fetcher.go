@@ -201,6 +201,7 @@ func (sf *SegmentFetcher) doFetch(ctx context.Context, segIdx int) error {
 
 	downloadCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	downloadCtx = nntp.WithWorkClass(downloadCtx, nntp.WorkClassStream)
 
 	// ExecuteWithFailover already retries per provider and across providers —
 	// a single call is sufficient.  An outer retry loop would multiply the

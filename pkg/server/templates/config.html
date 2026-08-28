@@ -488,6 +488,82 @@
                                                 </label>
                                             </div>
                                         </div>
+
+                                        <div class="mt-8 pt-6 border-t border-base-300">
+                                            <div class="divider my-2">Interactive Pool Reserve</div>
+                                            <p class="text-sm opacity-70 mb-4">When enabled, sustained playback reads reserve part of the NNTP pool so background imports do not starve Plex. Disabled by default.</p>
+                                            <div class="flex items-center gap-3 mb-4">
+                                                <input type="checkbox" class="checkbox checkbox-warning"
+                                                       name="usenet.interactive_pool_reserve_enabled"
+                                                       id="usenet.interactive_pool_reserve_enabled">
+                                                <label class="label cursor-pointer block" for="usenet.interactive_pool_reserve_enabled">
+                                                    <span class="font-medium">Reserve NNTP Pool During Playback</span>
+                                                    <span class="text-sm opacity-70 block">Caps background parse/repair work while sustained reads are detected.</span>
+                                                </label>
+                                            </div>
+                                            <div id="interactivePoolReserveAdvanced" class="hidden mt-4 space-y-4">
+                                                <div class="grid grid-cols-2 lg:grid-cols-3 gap-4">
+                                                    <div>
+                                                        <label class="label" for="usenet.interactive_pool_reserve_percent">
+                                                            <span class="font-medium">Reserve Percent</span>
+                                                        </label>
+                                                        <input type="number" class="input w-full"
+                                                               name="usenet.interactive_pool_reserve_percent"
+                                                               id="usenet.interactive_pool_reserve_percent" min="1" max="100"
+                                                               placeholder="15">
+                                                        <span class="text-sm opacity-70">Percent of total provider connections (default: 15)</span>
+                                                    </div>
+                                                    <div>
+                                                        <label class="label" for="usenet.interactive_pool_reserve_min">
+                                                            <span class="font-medium">Reserve Minimum</span>
+                                                        </label>
+                                                        <input type="number" class="input w-full"
+                                                               name="usenet.interactive_pool_reserve_min"
+                                                               id="usenet.interactive_pool_reserve_min" min="1"
+                                                               placeholder="6">
+                                                        <span class="text-sm opacity-70">Floor for small pools (default: 6)</span>
+                                                    </div>
+                                                    <div>
+                                                        <label class="label" for="usenet.interactive_pool_reserve_max">
+                                                            <span class="font-medium">Reserve Maximum</span>
+                                                        </label>
+                                                        <input type="number" class="input w-full"
+                                                               name="usenet.interactive_pool_reserve_max"
+                                                               id="usenet.interactive_pool_reserve_max" min="1"
+                                                               placeholder="40">
+                                                        <span class="text-sm opacity-70">Ceiling for large pools (default: 40)</span>
+                                                    </div>
+                                                    <div>
+                                                        <label class="label" for="usenet.interactive_detect_bytes">
+                                                            <span class="font-medium">Detect Bytes</span>
+                                                        </label>
+                                                        <input type="text" class="input w-full"
+                                                               name="usenet.interactive_detect_bytes"
+                                                               id="usenet.interactive_detect_bytes" placeholder="4MB">
+                                                        <span class="text-sm opacity-70">Qualifying bytes in detect window (default: 4MB)</span>
+                                                    </div>
+                                                    <div>
+                                                        <label class="label" for="usenet.interactive_detect_window">
+                                                            <span class="font-medium">Detect Window</span>
+                                                        </label>
+                                                        <input type="text" class="input w-full"
+                                                               name="usenet.interactive_detect_window"
+                                                               id="usenet.interactive_detect_window" placeholder="5s">
+                                                        <span class="text-sm opacity-70">Sliding window for detection (default: 5s)</span>
+                                                    </div>
+                                                    <div>
+                                                        <label class="label" for="usenet.interactive_idle_timeout">
+                                                            <span class="font-medium">Idle Timeout</span>
+                                                        </label>
+                                                        <input type="text" class="input w-full"
+                                                               name="usenet.interactive_idle_timeout"
+                                                               id="usenet.interactive_idle_timeout" placeholder="30s">
+                                                        <span class="text-sm opacity-70">Exit reserve after no reads (default: 30s)</span>
+                                                    </div>
+                                                </div>
+                                                <p id="interactivePoolReserveHint" class="text-sm opacity-70"></p>
+                                            </div>
+                                        </div>
                                     </div>
                                 </div>
 

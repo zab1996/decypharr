@@ -223,6 +223,8 @@ type Usenet struct {
 	prefetchSize             int64       // Streaming prefetch size in bytes
 	failedFiles              *xsync.Map[string, error]
 
+	onStreamBytes func(nzoID, filename string, n int64, probe bool)
+
 	fs *xsync.Map[string, *fsEntry]
 }
 
@@ -887,7 +889,12 @@ func (u *Usenet) Stream(ctx context.Context, nzoID, filename string, start, end 
 	defer releaseStreamBuffer(buf)
 
 	// Use a safe copy loop that checks context and validates read counts
-	_, err = safeCopyBuffer(ctx, writer, section, buf)
+	written, err := safeCopyBuffer(ctx, writer, section, buf)
+	if written > 0 && u.onStreamBytes != nil {
+		fileSize := ufsEntry.volumes[0].Size
+		probe := isInteractiveProbeRead(rangeStart, length, fileSize)
+		u.onStreamBytes(nzoID, filename, written, probe)
+	}
 
 	// Handle context cancellation explicitly
 	if err != nil && ctx.Err() != nil {
@@ -1288,3 +1295,41 @@ func fileExists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil
 }
+
+const interactiveProbeTailZone = 64 << 20
+
+func isInteractiveProbeRead(off, length, fileSize int64) bool {
+	if fileSize <= 0 || length <= 0 {
+		return false
+	}
+	return off+length >= fileSize-interactiveProbeTailZone
+}
+
+// SetStreamBytesRecorder registers a callback for bytes streamed to clients.
+func (u *Usenet) SetStreamBytesRecorder(fn func(nzoID, filename string, n int64, probe bool)) {
+	if u == nil {
+		return
+	}
+	u.onStreamBytes = fn
+}
+
+// ConfigureInteractiveReserve reloads NNTP reserve settings.
+func (u *Usenet) ConfigureInteractiveReserve(cfg *config.Config) {
+	if u == nil || u.nntp == nil || cfg == nil {
+		return
+	}
+	u.nntp.ConfigureInteractiveReserve(cfg)
+}
+
+// SetInteractiveReserveActive toggles interactive NNTP pool reserve mode.
+func (u *Usenet) SetInteractiveReserveActive(active bool, entry, file, client string, bytesInWindow int64, detectWindow time.Duration) {
+	if u == nil || u.nntp == nil {
+		return
+	}
+	u.nntp.SetInteractiveReserveActive(active, nntp.ReserveMeta{
+		Entry:  entry,
+		File:   file,
+		Client: client,
+	}, bytesInWindow, detectWindow)
+}
+

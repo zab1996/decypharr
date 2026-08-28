@@ -78,6 +78,8 @@ type Manager struct {
 	// Active streams tracking
 	activeStreams *xsync.Map[string, *ActiveStream]
 
+	interactive *InteractiveMonitor
+
 	// In-flight queue-processor dispatches, keyed by InfoHash, to prevent
 	// duplicate goroutines from processing the same entry when the scheduler
 	// re-fires before the previous pass has updated the queue row.
@@ -247,6 +249,7 @@ func (m *Manager) initUsenet() {
 		return
 	}
 	m.usenet = usenetClient
+	m.startInteractiveMonitor(m.config)
 }
 
 // initLinkService initializes the link service

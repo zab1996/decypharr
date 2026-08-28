@@ -229,6 +229,10 @@ type Connection struct {
 	// and the janitor should skip it.
 	lastProgressNS atomic.Int64
 	idleNS         atomic.Int64
+
+	// backgroundBudgetHeld is set when this checkout counted against the
+	// interactive pool reserve background budget.
+	backgroundBudgetHeld atomic.Bool
 }
 
 func (c *Connection) recordBodyUsage(bytes int64) {

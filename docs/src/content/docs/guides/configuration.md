@@ -117,6 +117,13 @@ Array of Debrid services:
     "processing_max_connections": 15,
     "read_ahead": "16MB",
     "pre_cache_on_open": false,
+    "interactive_pool_reserve_enabled": false,
+    "interactive_pool_reserve_percent": 15,
+    "interactive_pool_reserve_min": 6,
+    "interactive_pool_reserve_max": 40,
+    "interactive_detect_bytes": "4MB",
+    "interactive_detect_window": "5s",
+    "interactive_idle_timeout": "30s",
     "processing_timeout": "10m",
     "availability_sample_percent": 10,
     "import_availability_sample_percent": 1,
@@ -134,6 +141,13 @@ Array of Debrid services:
 | `processing_max_connections`  | int    | Max connections per file for parsing and NZB downloads | Same as `max_connections` |
 | `read_ahead`                  | string | Prefetch buffer size            | `16MB`                       |
 | `pre_cache_on_open`           | bool   | Fetch the head and tail when a Usenet file is opened; enabling this can add NNTP load during library scans | `false` |
+| `interactive_pool_reserve_enabled` | bool | Reserve NNTP pool capacity during sustained playback reads | `false` |
+| `interactive_pool_reserve_percent` | int | Percent of total provider connections to reserve when active | `15` |
+| `interactive_pool_reserve_min` | int | Minimum reserved connections (small pools) | `6` |
+| `interactive_pool_reserve_max` | int | Maximum reserved connections (large pools) | `40` |
+| `interactive_detect_bytes` | string | Qualifying bytes in the detect window to enter reserve mode | `4MB` |
+| `interactive_detect_window` | string | Sliding window for sustained-read detection | `5s` |
+| `interactive_idle_timeout` | string | Exit reserve mode after no qualifying reads | `30s` |
 | `processing_timeout`          | string | Max time for NZB processing     | `10m`                        |
 | `availability_sample_percent` | int    | % of segments to check during repairs (1-100) | `10`             |
 | `import_availability_sample_percent` | int | % of segments to check when adding an NZB (1-100) | `1`         |

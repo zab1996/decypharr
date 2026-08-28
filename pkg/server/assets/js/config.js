@@ -49,6 +49,24 @@ class ConfigManager {
         this.refs.addVirtualFolderBtn.addEventListener('click', () => this.addVirtualFolder());
         this.refs.addUsenetProviderBtn.addEventListener('click', () => this.addUsenetProvider());
 
+        const interactiveToggle = document.getElementById('usenet.interactive_pool_reserve_enabled');
+        if (interactiveToggle) {
+            interactiveToggle.addEventListener('change', () => this.updateInteractivePoolReserveUI());
+        }
+        ['interactive_pool_reserve_percent', 'interactive_pool_reserve_min', 'interactive_pool_reserve_max'].forEach((field) => {
+            const input = document.querySelector(`[name="usenet.${field}"]`);
+            if (input) {
+                input.addEventListener('input', () => this.updateInteractivePoolReserveHint());
+            }
+        });
+        if (this.refs.usenetProviders) {
+            this.refs.usenetProviders.addEventListener('input', (e) => {
+                if (e.target && e.target.name && e.target.name.includes('max_connections')) {
+                    this.updateInteractivePoolReserveHint();
+                }
+            });
+        }
+
         const addRuleBtn = document.getElementById('addQueueCleanupRuleBtn');
         if (addRuleBtn) addRuleBtn.addEventListener('click', () => this.addQueueCleanupCustomRow());
     }
@@ -1297,6 +1315,13 @@ class ConfigManager {
                 || 15,
             read_ahead: document.querySelector('[name="usenet.read_ahead"]').value || "16MB",
             pre_cache_on_open: document.querySelector('[name="usenet.pre_cache_on_open"]')?.checked || false,
+            interactive_pool_reserve_enabled: document.querySelector('[name="usenet.interactive_pool_reserve_enabled"]')?.checked || false,
+            interactive_pool_reserve_percent: parseInt(document.querySelector('[name="usenet.interactive_pool_reserve_percent"]')?.value) || 15,
+            interactive_pool_reserve_min: parseInt(document.querySelector('[name="usenet.interactive_pool_reserve_min"]')?.value) || 6,
+            interactive_pool_reserve_max: parseInt(document.querySelector('[name="usenet.interactive_pool_reserve_max"]')?.value) || 40,
+            interactive_detect_bytes: document.querySelector('[name="usenet.interactive_detect_bytes"]')?.value || "4MB",
+            interactive_detect_window: document.querySelector('[name="usenet.interactive_detect_window"]')?.value || "5s",
+            interactive_idle_timeout: document.querySelector('[name="usenet.interactive_idle_timeout"]')?.value || "30s",
             processing_timeout: document.querySelector('[name="usenet.processing_timeout"]')?.value || "5m",
             conn_idle_timeout: document.querySelector('[name="usenet.conn_idle_timeout"]')?.value || "",
             availability_sample_percent: parseInt(document.querySelector('[name="usenet.availability_sample_percent"]')?.value) || 10,
@@ -1834,6 +1859,13 @@ class ConfigManager {
             'processing_max_connections': usenet.processing_max_connections,
             'read_ahead': usenet.read_ahead,
             'pre_cache_on_open': usenet.pre_cache_on_open,
+            'interactive_pool_reserve_enabled': usenet.interactive_pool_reserve_enabled,
+            'interactive_pool_reserve_percent': usenet.interactive_pool_reserve_percent,
+            'interactive_pool_reserve_min': usenet.interactive_pool_reserve_min,
+            'interactive_pool_reserve_max': usenet.interactive_pool_reserve_max,
+            'interactive_detect_bytes': usenet.interactive_detect_bytes,
+            'interactive_detect_window': usenet.interactive_detect_window,
+            'interactive_idle_timeout': usenet.interactive_idle_timeout,
             'processing_timeout': usenet.processing_timeout,
             'conn_idle_timeout': usenet.conn_idle_timeout,
             'availability_sample_percent': usenet.availability_sample_percent,
@@ -1853,6 +1885,59 @@ class ConfigManager {
                 }
             }
         });
+        this.updateInteractivePoolReserveUI();
+    }
+
+    computeInteractiveReserve(totalConnections, percent, minReserve, maxReserve) {
+        if (!totalConnections || totalConnections <= 0) {
+            return 0;
+        }
+        const pct = percent > 0 ? percent : 15;
+        const min = minReserve > 0 ? minReserve : 6;
+        const max = maxReserve > 0 ? maxReserve : 40;
+        let reserve = Math.ceil((totalConnections * pct) / 100);
+        if (reserve < min) reserve = min;
+        if (reserve > max) reserve = max;
+        if (reserve >= totalConnections) return totalConnections;
+        return reserve;
+    }
+
+    sumUsenetProviderConnections() {
+        let total = 0;
+        this.refs.usenetProviders.querySelectorAll('[name$=".max_connections"]').forEach((input) => {
+            const value = parseInt(input.value, 10);
+            if (!Number.isNaN(value) && value > 0) {
+                total += value;
+            }
+        });
+        return total;
+    }
+
+    updateInteractivePoolReserveUI() {
+        const toggle = document.getElementById('usenet.interactive_pool_reserve_enabled');
+        const advanced = document.getElementById('interactivePoolReserveAdvanced');
+        if (!toggle || !advanced) {
+            return;
+        }
+        advanced.classList.toggle('hidden', !toggle.checked);
+        this.updateInteractivePoolReserveHint();
+    }
+
+    updateInteractivePoolReserveHint() {
+        const hint = document.getElementById('interactivePoolReserveHint');
+        if (!hint) {
+            return;
+        }
+        const total = this.sumUsenetProviderConnections();
+        const percent = parseInt(document.querySelector('[name="usenet.interactive_pool_reserve_percent"]')?.value, 10) || 15;
+        const min = parseInt(document.querySelector('[name="usenet.interactive_pool_reserve_min"]')?.value, 10) || 6;
+        const max = parseInt(document.querySelector('[name="usenet.interactive_pool_reserve_max"]')?.value, 10) || 40;
+        if (!total) {
+            hint.textContent = 'Add NNTP servers below to preview how many connections will be reserved during playback.';
+            return;
+        }
+        const reserve = this.computeInteractiveReserve(total, percent, min, max);
+        hint.textContent = `With your ${total} configured connections, reserves ~${reserve} slots for playback during sustained reads.`;
     }
 
     addUsenetProvider(data = {}) {
@@ -1865,6 +1950,7 @@ class ConfigManager {
         }
 
         this.usenetProviderCount++;
+        this.updateInteractivePoolReserveHint();
     }
 
     populateUsenetProviderData(index, data) {

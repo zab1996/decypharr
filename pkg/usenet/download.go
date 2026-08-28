@@ -132,7 +132,8 @@ func (u *Usenet) Download(ctx context.Context, nzoID, filename string, writer io
 
 			// Fetch segment using manager with failover
 			var data []byte
-			err := u.nntp.ExecuteWithFailover(ctx, func(conn *nntp.Connection) error {
+			bgCtx := nntp.WithWorkClass(ctx, nntp.WorkClassBackground)
+			err := u.nntp.ExecuteWithFailover(bgCtx, func(conn *nntp.Connection) error {
 				d, e := conn.GetDecodedBody(seg.MessageID)
 				data = d
 				return e
