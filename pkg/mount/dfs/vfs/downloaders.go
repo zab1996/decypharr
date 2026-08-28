@@ -1455,11 +1455,11 @@ func (w *cacheWriter) Write(p []byte) (int, error) {
 	actuallyWritten := int64(n - skipped)
 	w.written += actuallyWritten
 
+	if n > 0 && w.dl.dls.manager != nil {
+		w.dl.dls.manager.RecordStreamActivity(w.dl.dls.streamID, int64(n), actuallyWritten, w.dl.dls.interactiveProbe.Load())
+	}
 	if actuallyWritten > 0 {
 		w.dl.dls.item.cache.AddDownloadedBytes(actuallyWritten)
-		if w.dl.dls.manager != nil {
-			w.dl.dls.manager.RecordStreamActivity(w.dl.dls.streamID, actuallyWritten, w.dl.dls.interactiveProbe.Load())
-		}
 		if w.dl.dls.waiterCount.Load() > 0 {
 			w.dl.dls.kickWaiters()
 		}

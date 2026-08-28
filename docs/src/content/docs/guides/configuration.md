@@ -118,6 +118,7 @@ Array of Debrid services:
     "read_ahead": "16MB",
     "pre_cache_on_open": false,
     "interactive_pool_reserve_enabled": false,
+    "interactive_pool_reserve_per_stream": 0,
     "interactive_pool_reserve_percent": 15,
     "interactive_pool_reserve_min": 6,
     "interactive_pool_reserve_max": 40,
@@ -140,11 +141,12 @@ Array of Debrid services:
 | `max_connections`             | int    | Max connections per streaming file | `15`                      |
 | `processing_max_connections`  | int    | Max connections per file for parsing and NZB downloads | Same as `max_connections` |
 | `read_ahead`                  | string | Prefetch buffer size            | `16MB`                       |
-| `pre_cache_on_open`           | bool   | Fetch the head and tail when a Usenet file is opened; enabling this can add NNTP load during library scans | `false` |
-| `interactive_pool_reserve_enabled` | bool | Reserve NNTP pool capacity during sustained playback reads | `false` |
-| `interactive_pool_reserve_percent` | int | Percent of total provider connections to reserve when active | `15` |
-| `interactive_pool_reserve_min` | int | Minimum reserved connections (small pools) | `6` |
-| `interactive_pool_reserve_max` | int | Maximum reserved connections (large pools) | `40` |
+| `pre_cache_on_open`           | bool   | Fetch the head and tail when a Usenet file is opened; throttled as background work while playback protection is active | `false` |
+| `interactive_pool_reserve_enabled` | bool | Dynamically protect active playback streams from background NNTP contention | `false` |
+| `interactive_pool_reserve_per_stream` | int | Connections reserved per active stream (0 = auto from percent) | `0` |
+| `interactive_pool_reserve_percent` | int | Auto per-stream baseline as percent of total pool when per-stream is 0 | `15` |
+| `interactive_pool_reserve_min` | int | Minimum total reserve floor (small pools) | `6` |
+| `interactive_pool_reserve_max` | int | Maximum total protected connections across all streams | `40` |
 | `interactive_detect_bytes` | string | Qualifying bytes in the detect window to enter reserve mode | `4MB` |
 | `interactive_detect_window` | string | Sliding window for sustained-read detection | `5s` |
 | `interactive_idle_timeout` | string | Exit reserve mode after no qualifying reads | `30s` |

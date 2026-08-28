@@ -1172,7 +1172,57 @@
                                     </span>
                                 </div>
                             </div>
+                `;
 
+                const interactive = usenetData.interactive || {};
+                if (interactive.enabled) {
+                    const reserveActive = !!interactive.active;
+                    const activeStreams = interactive.active_streams || 0;
+                    const perStreamReserve = interactive.per_stream_reserve || 0;
+                    const reserved = interactive.reserved || 0;
+                    const backgroundBudget = interactive.background_budget || 0;
+                    const backgroundInUse = interactive.background_in_use || 0;
+                    const streamInUse = interactive.stream_in_use || 0;
+                    const reserveBadge = reserveActive
+                        ? '<span class="badge badge-warning badge-sm">Active</span>'
+                        : '<span class="badge badge-ghost badge-sm">Idle</span>';
+
+                    html += `
+                            <div class="mt-4 p-3 rounded-box bg-base-300/40">
+                                <div class="flex justify-between items-center mb-2">
+                                    <h4 class="font-semibold text-sm flex items-center gap-2">
+                                        <i class="bi bi-shield-check text-warning"></i>
+                                        Playback Protection
+                                    </h4>
+                                    ${reserveBadge}
+                                </div>
+                                <div class="grid grid-cols-2 md:grid-cols-3 gap-2 text-xs">
+                                    <div>
+                                        <span class="text-base-content/70">Active streams</span>
+                                        <div class="font-mono">${activeStreams}</div>
+                                    </div>
+                                    <div>
+                                        <span class="text-base-content/70">Per stream reserve</span>
+                                        <div class="font-mono">${perStreamReserve}</div>
+                                    </div>
+                                    <div>
+                                        <span class="text-base-content/70">Total protected</span>
+                                        <div class="font-mono">${reserved}</div>
+                                    </div>
+                                    <div>
+                                        <span class="text-base-content/70">Background budget</span>
+                                        <div class="font-mono">${backgroundInUse} / ${backgroundBudget}</div>
+                                    </div>
+                                    <div>
+                                        <span class="text-base-content/70">Stream in use</span>
+                                        <div class="font-mono">${streamInUse}</div>
+                                    </div>
+                                </div>
+                            </div>
+                    `;
+                }
+
+                html += `
                             <!-- NNTP Servers -->
                             <div class="mt-4">
                                 <h4 class="font-semibold mb-2 text-sm">

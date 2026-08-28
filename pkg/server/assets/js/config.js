@@ -53,7 +53,7 @@ class ConfigManager {
         if (interactiveToggle) {
             interactiveToggle.addEventListener('change', () => this.updateInteractivePoolReserveUI());
         }
-        ['interactive_pool_reserve_percent', 'interactive_pool_reserve_min', 'interactive_pool_reserve_max'].forEach((field) => {
+        ['interactive_pool_reserve_per_stream', 'interactive_pool_reserve_percent', 'interactive_pool_reserve_max'].forEach((field) => {
             const input = document.querySelector(`[name="usenet.${field}"]`);
             if (input) {
                 input.addEventListener('input', () => this.updateInteractivePoolReserveHint());
@@ -1316,6 +1316,7 @@ class ConfigManager {
             read_ahead: document.querySelector('[name="usenet.read_ahead"]').value || "16MB",
             pre_cache_on_open: document.querySelector('[name="usenet.pre_cache_on_open"]')?.checked || false,
             interactive_pool_reserve_enabled: document.querySelector('[name="usenet.interactive_pool_reserve_enabled"]')?.checked || false,
+            interactive_pool_reserve_per_stream: parseInt(document.querySelector('[name="usenet.interactive_pool_reserve_per_stream"]')?.value, 10) || 0,
             interactive_pool_reserve_percent: parseInt(document.querySelector('[name="usenet.interactive_pool_reserve_percent"]')?.value) || 15,
             interactive_pool_reserve_min: parseInt(document.querySelector('[name="usenet.interactive_pool_reserve_min"]')?.value) || 6,
             interactive_pool_reserve_max: parseInt(document.querySelector('[name="usenet.interactive_pool_reserve_max"]')?.value) || 40,
@@ -1860,6 +1861,7 @@ class ConfigManager {
             'read_ahead': usenet.read_ahead,
             'pre_cache_on_open': usenet.pre_cache_on_open,
             'interactive_pool_reserve_enabled': usenet.interactive_pool_reserve_enabled,
+            'interactive_pool_reserve_per_stream': usenet.interactive_pool_reserve_per_stream,
             'interactive_pool_reserve_percent': usenet.interactive_pool_reserve_percent,
             'interactive_pool_reserve_min': usenet.interactive_pool_reserve_min,
             'interactive_pool_reserve_max': usenet.interactive_pool_reserve_max,
@@ -1888,18 +1890,37 @@ class ConfigManager {
         this.updateInteractivePoolReserveUI();
     }
 
-    computeInteractiveReserve(totalConnections, percent, minReserve, maxReserve) {
+    computePerStreamReserveBase(totalConnections, percent, minReserve, perStreamOverride) {
+        if (perStreamOverride > 0) {
+            return perStreamOverride;
+        }
         if (!totalConnections || totalConnections <= 0) {
             return 0;
         }
         const pct = percent > 0 ? percent : 15;
         const min = minReserve > 0 ? minReserve : 6;
-        const max = maxReserve > 0 ? maxReserve : 40;
         let reserve = Math.ceil((totalConnections * pct) / 100);
         if (reserve < min) reserve = min;
-        if (reserve > max) reserve = max;
         if (reserve >= totalConnections) return totalConnections;
         return reserve;
+    }
+
+    computeDynamicInteractiveReserve(totalConnections, activeStreams, percent, minReserve, maxTotal, perStreamOverride) {
+        if (!totalConnections || totalConnections <= 0 || !activeStreams || activeStreams <= 0) {
+            return {reserved: 0, perStream: 0, background: totalConnections || 0};
+        }
+        const max = maxTotal > 0 ? maxTotal : 40;
+        const perStream = this.computePerStreamReserveBase(totalConnections, percent, minReserve, perStreamOverride);
+        let reserved = perStream * activeStreams;
+        const min = minReserve > 0 ? minReserve : 6;
+        if (reserved < min) reserved = min;
+        if (reserved > max) reserved = max;
+        if (reserved >= totalConnections) reserved = totalConnections;
+        return {reserved, perStream, background: totalConnections - reserved};
+    }
+
+    computeInteractiveReserve(totalConnections, percent, minReserve, maxReserve) {
+        return this.computeDynamicInteractiveReserve(totalConnections, 1, percent, minReserve, maxReserve, 0).reserved;
     }
 
     sumUsenetProviderConnections() {
@@ -1932,12 +1953,17 @@ class ConfigManager {
         const percent = parseInt(document.querySelector('[name="usenet.interactive_pool_reserve_percent"]')?.value, 10) || 15;
         const min = parseInt(document.querySelector('[name="usenet.interactive_pool_reserve_min"]')?.value, 10) || 6;
         const max = parseInt(document.querySelector('[name="usenet.interactive_pool_reserve_max"]')?.value, 10) || 40;
+        const perStreamOverride = parseInt(document.querySelector('[name="usenet.interactive_pool_reserve_per_stream"]')?.value, 10) || 0;
         if (!total) {
-            hint.textContent = 'Add NNTP servers below to preview how many connections will be reserved during playback.';
+            hint.textContent = 'Add NNTP servers below to preview per-stream protection during playback.';
             return;
         }
-        const reserve = this.computeInteractiveReserve(total, percent, min, max);
-        hint.textContent = `With your ${total} configured connections, reserves ~${reserve} slots for playback during sustained reads.`;
+        const preview = [1, 2, 3].map((streams) => {
+            const snap = this.computeDynamicInteractiveReserve(total, streams, percent, min, max, perStreamOverride);
+            return `${streams} stream${streams > 1 ? 's' : ''} → ${snap.reserved} protected / ${snap.background} background`;
+        });
+        const perStream = this.computePerStreamReserveBase(total, percent, min, perStreamOverride);
+        hint.textContent = `With ${total} configured connections (~${perStream} per stream): ${preview.join(' | ')}`;
     }
 
     addUsenetProvider(data = {}) {

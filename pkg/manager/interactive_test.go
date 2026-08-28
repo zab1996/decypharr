@@ -16,16 +16,16 @@ func TestInteractiveMonitorDetectsSustainedReads(t *testing.T) {
 			InteractiveDetectWindow:       "5s",
 			InteractiveIdleTimeout:        "30s",
 		},
-	}, func(a bool, _ reserveStreamMeta, _ int64, _ time.Duration) {
+	}, func(a bool, _ reserveStreamMeta, _ int, _ int64, _ time.Duration) {
 		active = a
 	})
 
 	meta := reserveStreamMeta{Entry: "Show", File: "ep.mkv", Client: "DFS"}
-	m.RecordRead(2<<20, false, meta)
+	m.RecordRead(2<<20, 2<<20, false, meta)
 	if active {
 		t.Fatal("should not activate below threshold")
 	}
-	m.RecordRead(3<<20, false, meta)
+	m.RecordRead(3<<20, 3<<20, false, meta)
 	if !active {
 		t.Fatal("expected interactive mode after sustained reads")
 	}
@@ -38,10 +38,10 @@ func TestInteractiveMonitorIgnoresProbes(t *testing.T) {
 			InteractivePoolReserveEnabled: true,
 			InteractiveDetectBytes:        "1MB",
 		},
-	}, func(a bool, _ reserveStreamMeta, _ int64, _ time.Duration) {
+	}, func(a bool, _ reserveStreamMeta, _ int, _ int64, _ time.Duration) {
 		active = a
 	})
-	m.RecordRead(5<<20, true, reserveStreamMeta{Entry: "Show", File: "ep.mkv"})
+	m.RecordRead(5<<20, 5<<20, true, reserveStreamMeta{Entry: "Show", File: "ep.mkv"})
 	if active {
 		t.Fatal("probe reads must not activate interactive mode")
 	}
@@ -55,15 +55,42 @@ func TestInteractiveMonitorIdleTimeout(t *testing.T) {
 			InteractiveDetectBytes:        "1MB",
 			InteractiveIdleTimeout:        "1s",
 		},
-	}, func(a bool, _ reserveStreamMeta, _ int64, _ time.Duration) {
+	}, func(a bool, _ reserveStreamMeta, _ int, _ int64, _ time.Duration) {
 		active = a
 	})
-	m.RecordRead(2<<20, false, reserveStreamMeta{Entry: "Show", File: "ep.mkv"})
+	m.RecordRead(2<<20, 2<<20, false, reserveStreamMeta{Entry: "Show", File: "ep.mkv"})
 	if !active {
 		t.Fatal("expected active")
 	}
 	m.Tick(time.Now().Add(2 * time.Second))
 	if active {
 		t.Fatal("expected idle timeout to deactivate")
+	}
+}
+
+func TestInteractiveMonitorCacheHitKeepsAlive(t *testing.T) {
+	var active bool
+	var deactivate bool
+	m := newInteractiveMonitor(&config.Config{
+		Usenet: config.Usenet{
+			InteractivePoolReserveEnabled: true,
+			InteractiveDetectBytes:        "4MB",
+			InteractiveIdleTimeout:        "1s",
+		},
+	}, func(a bool, _ reserveStreamMeta, _ int, _ int64, _ time.Duration) {
+		if a {
+			active = true
+		} else {
+			deactivate = true
+		}
+	})
+	m.RecordRead(4<<20, 4<<20, false, reserveStreamMeta{Entry: "Show", File: "ep.mkv"})
+	if !active {
+		t.Fatal("expected active")
+	}
+	m.RecordRead(0, 1<<20, false, reserveStreamMeta{Entry: "Show", File: "ep.mkv"})
+	m.Tick(time.Now().Add(500 * time.Millisecond))
+	if deactivate {
+		t.Fatal("cache-served reads should keep reserve alive")
 	}
 }

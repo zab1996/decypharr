@@ -30,7 +30,7 @@ type InteractiveMonitor struct {
 
 	active bool
 
-	onChange func(active bool, meta reserveStreamMeta, bytesInWindow int64, detectWindow time.Duration)
+	onChange func(active bool, meta reserveStreamMeta, activeStreams int, bytesInWindow int64, detectWindow time.Duration)
 }
 
 type reserveStreamMeta struct {
@@ -39,7 +39,7 @@ type reserveStreamMeta struct {
 	Client string
 }
 
-func newInteractiveMonitor(cfg *config.Config, onChange func(bool, reserveStreamMeta, int64, time.Duration)) *InteractiveMonitor {
+func newInteractiveMonitor(cfg *config.Config, onChange func(bool, reserveStreamMeta, int, int64, time.Duration)) *InteractiveMonitor {
 	m := &InteractiveMonitor{onChange: onChange}
 	m.applyConfig(cfg)
 	return m
@@ -69,14 +69,15 @@ func (m *InteractiveMonitor) applyConfig(cfg *config.Config) {
 		if m.onChange != nil {
 			meta := m.lastMeta
 			m.mu.Unlock()
-			m.onChange(false, meta, 0, m.detectWindow)
+			m.onChange(false, meta, 0, 0, m.detectWindow)
 			m.mu.Lock()
 		}
 	}
 }
 
-func (m *InteractiveMonitor) RecordRead(n int64, probe bool, meta reserveStreamMeta) {
-	if m == nil || n <= 0 {
+// RecordRead records new bytes for activation and total bytes for idle keepalive.
+func (m *InteractiveMonitor) RecordRead(newBytes, totalBytes int64, probe bool, meta reserveStreamMeta) {
+	if m == nil {
 		return
 	}
 	m.mu.Lock()
@@ -85,11 +86,16 @@ func (m *InteractiveMonitor) RecordRead(n int64, probe bool, meta reserveStreamM
 		return
 	}
 	now := time.Now()
-	m.samples = append(m.samples, interactiveSample{at: now, bytes: n})
-	if meta.Entry != "" {
-		m.lastMeta = meta
+	if totalBytes > 0 {
+		m.lastQualifyingAt = now
+		if meta.Entry != "" {
+			m.lastMeta = meta
+		}
 	}
-	m.lastQualifyingAt = now
+	if newBytes <= 0 {
+		return
+	}
+	m.samples = append(m.samples, interactiveSample{at: now, bytes: newBytes})
 	m.pruneLocked(now)
 	m.evaluateLocked(now)
 }
@@ -111,7 +117,7 @@ func (m *InteractiveMonitor) Tick(now time.Time) {
 			if m.onChange != nil {
 				meta := m.lastMeta
 				m.mu.Unlock()
-				m.onChange(false, meta, 0, m.detectWindow)
+				m.onChange(false, meta, 0, 0, m.detectWindow)
 				m.mu.Lock()
 			}
 		}
@@ -147,7 +153,7 @@ func (m *InteractiveMonitor) evaluateLocked(now time.Time) {
 		bytes := total
 		window := m.detectWindow
 		m.mu.Unlock()
-		m.onChange(true, meta, bytes, window)
+		m.onChange(true, meta, 1, bytes, window)
 		m.mu.Lock()
 	}
 }
@@ -163,8 +169,8 @@ func (m *InteractiveMonitor) Active() bool {
 }
 
 // RecordStreamActivity updates LastActive and records qualifying bytes for a tracked stream.
-func (m *Manager) RecordStreamActivity(streamID string, n int64, probe bool) {
-	if m == nil || n <= 0 || m.interactive == nil {
+func (m *Manager) RecordStreamActivity(streamID string, totalBytes, newBytes int64, probe bool) {
+	if m == nil || m.interactive == nil {
 		return
 	}
 	var meta reserveStreamMeta
@@ -175,7 +181,41 @@ func (m *Manager) RecordStreamActivity(streamID string, n int64, probe bool) {
 			meta = reserveStreamMeta{Entry: s.EntryName, File: s.FileName, Client: s.Client}
 		}
 	}
-	m.interactive.RecordRead(n, probe, meta)
+	m.interactive.RecordRead(newBytes, totalBytes, probe, meta)
+	if m.interactive.Active() {
+		m.pushInteractiveStreamCount()
+	}
+}
+
+func (m *Manager) countQualifyingStreams() int {
+	if m == nil {
+		return 0
+	}
+	idle := 30 * time.Second
+	if cfg := config.Get(); cfg != nil {
+		if d, err := utils.ParseDuration(cfg.Usenet.InteractiveIdleTimeout); err == nil && d > 0 {
+			idle = d
+		}
+	}
+	cutoff := utils.NowUnix() - int64(idle.Seconds())
+	count := 0
+	m.activeStreams.Range(func(_ string, stream *ActiveStream) bool {
+		if stream != nil && stream.LastActive >= cutoff {
+			count++
+		}
+		return true
+	})
+	if count == 0 {
+		return 1
+	}
+	return count
+}
+
+func (m *Manager) pushInteractiveStreamCount() {
+	if m == nil || m.usenet == nil || m.interactive == nil || !m.interactive.Active() {
+		return
+	}
+	m.usenet.SetInteractiveStreamCount(m.countQualifyingStreams())
 }
 
 func (m *Manager) startInteractiveMonitor(cfg *config.Config) {
@@ -184,11 +224,14 @@ func (m *Manager) startInteractiveMonitor(cfg *config.Config) {
 	}
 	m.usenet.ConfigureInteractiveReserve(cfg)
 	m.usenet.SetStreamBytesRecorder(func(nzoID, filename string, n int64, probe bool) {
-		m.RecordStreamActivity(nzoID+":"+filename, n, probe)
+		m.RecordStreamActivity(nzoID+":"+filename, n, n, probe)
 	})
-	m.interactive = newInteractiveMonitor(cfg, func(active bool, meta reserveStreamMeta, bytesInWindow int64, detectWindow time.Duration) {
+	m.interactive = newInteractiveMonitor(cfg, func(active bool, meta reserveStreamMeta, activeStreams int, bytesInWindow int64, detectWindow time.Duration) {
 		if m.usenet != nil {
-			m.usenet.SetInteractiveReserveActive(active, meta.Entry, meta.File, meta.Client, bytesInWindow, detectWindow)
+			if active && activeStreams <= 0 {
+				activeStreams = m.countQualifyingStreams()
+			}
+			m.usenet.SetInteractiveReserveActive(active, meta.Entry, meta.File, meta.Client, activeStreams, bytesInWindow, detectWindow)
 		}
 	})
 	go m.interactiveMonitorLoop()
@@ -204,6 +247,9 @@ func (m *Manager) interactiveMonitorLoop() {
 		case now := <-ticker.C:
 			if m.interactive != nil {
 				m.interactive.Tick(now)
+				if m.interactive.Active() {
+					m.pushInteractiveStreamCount()
+				}
 			}
 		}
 	}
@@ -216,5 +262,13 @@ func (m *Manager) ReconfigureInteractiveMonitor(cfg *config.Config) {
 	}
 	if m.usenet != nil {
 		m.usenet.ConfigureInteractiveReserve(cfg)
+		if m.interactive != nil && m.interactive.Active() {
+			m.pushInteractiveStreamCount()
+		}
 	}
+}
+
+// NotifyInteractiveStreamCount pushes the current active stream count to NNTP reserve.
+func (m *Manager) NotifyInteractiveStreamCount() {
+	m.pushInteractiveStreamCount()
 }

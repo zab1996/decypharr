@@ -25,7 +25,7 @@ func TestInteractiveReserveComputation(t *testing.T) {
 		},
 	})
 
-	entered, _, snap := state.setActive(true, 310, reserveMeta{Entry: "show", File: "ep.mkv", Client: "DFS"})
+	entered, _, _, snap := state.setActive(true, 310, 1, reserveMeta{Entry: "show", File: "ep.mkv", Client: "DFS"})
 	if !entered {
 		t.Fatal("expected mode enter")
 	}
@@ -36,9 +36,34 @@ func TestInteractiveReserveComputation(t *testing.T) {
 		t.Fatalf("background budget = %d, want 270", snap.BackgroundBudget)
 	}
 
-	_, exited, _ := state.setActive(false, 310, reserveMeta{})
+	_, exited, _, _ := state.setActive(false, 310, 0, reserveMeta{})
 	if !exited {
 		t.Fatal("expected mode exit")
+	}
+}
+
+func TestInteractiveReserveScalesWithStreams(t *testing.T) {
+	state := newInteractiveState(&config.Config{
+		Usenet: config.Usenet{
+			InteractivePoolReserveEnabled: true,
+			InteractivePoolReservePercent: 15,
+			InteractivePoolReserveMin:     6,
+			InteractivePoolReserveMax:     100,
+		},
+	})
+	_, _, _, snap := state.setActive(true, 310, 1, reserveMeta{})
+	if snap.Reserved != 47 {
+		t.Fatalf("1 stream reserved = %d, want 47", snap.Reserved)
+	}
+	changed, snap := state.setStreamCount(310, 2)
+	if !changed {
+		t.Fatal("expected reserve change for 2 streams")
+	}
+	if snap.Reserved != 94 {
+		t.Fatalf("2 streams reserved = %d, want 94", snap.Reserved)
+	}
+	if snap.BackgroundBudget != 216 {
+		t.Fatalf("2 streams background = %d, want 216", snap.BackgroundBudget)
 	}
 }
 
@@ -46,7 +71,7 @@ func TestBackgroundBudgetBlocksWhenFull(t *testing.T) {
 	state := newInteractiveState(&config.Config{
 		Usenet: config.Usenet{InteractivePoolReserveEnabled: true},
 	})
-	state.setActive(true, 20, reserveMeta{})
+	state.setActive(true, 20, 1, reserveMeta{})
 
 	if !state.acquireBackgroundSlot() {
 		t.Fatal("first background slot should succeed")
@@ -84,5 +109,25 @@ func TestRepairPoolInteractiveCap(t *testing.T) {
 	p.setInteractiveCap(0)
 	if got := p.effectiveCap(); got != 20 {
 		t.Fatalf("effectiveCap = %d, want 20 when cap cleared", got)
+	}
+}
+
+func TestProviderHeadroom(t *testing.T) {
+	state := newInteractiveState(&config.Config{
+		Usenet: config.Usenet{
+			InteractivePoolReserveEnabled: true,
+			InteractivePoolReservePercent: 15,
+			InteractivePoolReserveMax:     100,
+		},
+	})
+	_, _, _, snap := state.setActive(true, 100, 1, reserveMeta{})
+	if snap.Reserved != 15 {
+		t.Fatalf("reserved = %d, want 15", snap.Reserved)
+	}
+	if !state.backgroundMayUseProvider(84, 100, 100) {
+		t.Fatal("background should be allowed below headroom")
+	}
+	if state.backgroundMayUseProvider(86, 100, 100) {
+		t.Fatal("background should be blocked at headroom")
 	}
 }

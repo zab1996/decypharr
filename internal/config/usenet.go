@@ -79,11 +79,14 @@ type Usenet struct {
 	// capped so streaming keeps headroom. Default off.
 	InteractivePoolReserveEnabled bool `json:"interactive_pool_reserve_enabled,omitempty"`
 	// InteractivePoolReservePercent is the share of total provider slots to hold
-	// for interactive reads when reserve mode is active (default 15).
+	// per active stream when reserve mode is active (default 15).
 	InteractivePoolReservePercent int `json:"interactive_pool_reserve_percent,omitempty"`
+	// InteractivePoolReservePerStream optionally overrides the computed per-stream
+	// reserve. When zero, derived from InteractivePoolReservePercent.
+	InteractivePoolReservePerStream int `json:"interactive_pool_reserve_per_stream,omitempty"`
 	// InteractivePoolReserveMin is the floor for computed reserve (default 6).
 	InteractivePoolReserveMin int `json:"interactive_pool_reserve_min,omitempty"`
-	// InteractivePoolReserveMax caps reserve on large pools (default 40).
+	// InteractivePoolReserveMax caps total reserve across all active streams (default 40).
 	InteractivePoolReserveMax int `json:"interactive_pool_reserve_max,omitempty"`
 	// InteractiveDetectBytes is how many qualifying bytes in the detect window
 	// trigger interactive mode (default 4MB).
@@ -154,8 +157,14 @@ func (u Usenet) InteractiveDetectBytesValue() int64 {
 }
 
 // ComputeInteractiveReserve returns reserved slots for interactive work given
-// total provider connection capacity.
+// total provider connection capacity. Kept for backward compatibility.
 func ComputeInteractiveReserve(totalConnections, percent, minReserve, maxReserve int) int {
+	reserved, _ := ComputeDynamicInteractiveReserve(totalConnections, 1, percent, minReserve, maxReserve, 0)
+	return reserved
+}
+
+// ComputePerStreamReserveBase returns the per-stream reserve baseline from percent/min.
+func ComputePerStreamReserveBase(totalConnections, percent, minReserve int) int {
 	if totalConnections <= 0 {
 		return 0
 	}
@@ -165,20 +174,48 @@ func ComputeInteractiveReserve(totalConnections, percent, minReserve, maxReserve
 	if minReserve <= 0 {
 		minReserve = 6
 	}
-	if maxReserve <= 0 {
-		maxReserve = 40
-	}
 	reserve := (totalConnections*percent + 99) / 100
 	if reserve < minReserve {
 		reserve = minReserve
-	}
-	if reserve > maxReserve {
-		reserve = maxReserve
 	}
 	if reserve >= totalConnections {
 		return totalConnections
 	}
 	return reserve
+}
+
+// ComputeDynamicInteractiveReserve scales reserve by active playback streams.
+// perStreamOverride, when > 0, replaces the percent-derived per-stream baseline.
+func ComputeDynamicInteractiveReserve(totalConnections, activeStreams, percent, minReserve, maxTotal, perStreamOverride int) (reserved, perStream int) {
+	if totalConnections <= 0 || activeStreams <= 0 {
+		return 0, 0
+	}
+	if maxTotal <= 0 {
+		maxTotal = 40
+	}
+	perStream = perStreamOverride
+	if perStream <= 0 {
+		perStream = ComputePerStreamReserveBase(totalConnections, percent, minReserve)
+	}
+	reserved = perStream * activeStreams
+	if reserved < minReserve {
+		reserved = minReserve
+	}
+	if reserved > maxTotal {
+		reserved = maxTotal
+	}
+	if reserved >= totalConnections {
+		return totalConnections, perStream
+	}
+	return reserved, perStream
+}
+
+// InteractivePerStreamReserve resolves the configured per-stream reserve baseline.
+func (u Usenet) InteractivePerStreamReserve(totalConnections int) int {
+	if u.InteractivePoolReservePerStream > 0 {
+		return u.InteractivePoolReservePerStream
+	}
+	return ComputePerStreamReserveBase(totalConnections, u.InteractivePoolReservePercent, u.InteractivePoolReserveMin)
 }
 
 func (c *Config) updateUsenetConfig() {
@@ -321,6 +358,11 @@ func (c *Config) applyUsenetEnvVars() {
 	if v := getEnv("USENET__INTERACTIVE_POOL_RESERVE_PERCENT"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			c.Usenet.InteractivePoolReservePercent = n
+		}
+	}
+	if v := getEnv("USENET__INTERACTIVE_POOL_RESERVE_PER_STREAM"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Usenet.InteractivePoolReservePerStream = n
 		}
 	}
 	if v := getEnv("USENET__INTERACTIVE_POOL_RESERVE_MIN"); v != "" {

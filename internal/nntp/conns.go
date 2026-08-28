@@ -233,6 +233,8 @@ type Connection struct {
 	// backgroundBudgetHeld is set when this checkout counted against the
 	// interactive pool reserve background budget.
 	backgroundBudgetHeld atomic.Bool
+	// streamBudgetHeld is set when this checkout counted against stream reserve.
+	streamBudgetHeld atomic.Bool
 }
 
 func (c *Connection) recordBodyUsage(bytes int64) {

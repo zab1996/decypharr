@@ -607,6 +607,12 @@ func (c *Client) getAnyAvailableConnection(ctx context.Context, exclusions provi
 		eligibleCount++
 		pp := c.pools[provider.Host]
 
+		if WorkClassFromContext(ctx) == WorkClassBackground && c.interactiveReserveActive() {
+			if !c.interactive.backgroundMayUseProvider(len(pp.slots), pp.max, c.TotalConnections()) {
+				continue
+			}
+		}
+
 		select {
 		case pp.slots <- struct{}{}:
 			// Got a slot - try to get or create connection
@@ -674,6 +680,10 @@ func (c *Client) raceForConnection(ctx context.Context, eligible []config.Usenet
 		go func(p config.UsenetProvider) {
 			defer wg.Done()
 			pp := c.pools[p.Host]
+
+			if err := c.waitProviderHeadroom(innerCtx, pp); err != nil {
+				return
+			}
 
 			// Block waiting for slot (respects context)
 			select {
@@ -1184,12 +1194,16 @@ func (c *Client) Stats() map[string]interface{} {
 		stats["interactive"] = map[string]interface{}{
 			"enabled":              snap.Enabled,
 			"active":               snap.Active,
+			"active_streams":       snap.ActiveStreams,
+			"per_stream_reserve":   snap.PerStreamReserve,
 			"reserved":             snap.Reserved,
 			"background_budget":    snap.BackgroundBudget,
 			"background_in_use":    snap.BackgroundInUse,
+			"stream_in_use":        snap.StreamInUse,
 			"reserve_percent":      snap.ReservePercent,
 			"reserve_min":          snap.ReserveMin,
 			"reserve_max":          snap.ReserveMax,
+			"reserve_per_stream":   snap.ReservePerStream,
 			"last_entry":           snap.LastEntry,
 			"last_file":            snap.LastFile,
 			"last_client":          snap.LastClient,

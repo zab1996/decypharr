@@ -77,6 +77,20 @@ func TestComputeInteractiveReserve(t *testing.T) {
 	}
 }
 
+func TestComputeDynamicInteractiveReserve(t *testing.T) {
+	reserved, perStream := ComputeDynamicInteractiveReserve(310, 2, 15, 6, 100, 0)
+	if perStream != 47 {
+		t.Fatalf("perStream = %d, want 47", perStream)
+	}
+	if reserved != 94 {
+		t.Fatalf("reserved = %d, want 94", reserved)
+	}
+	reserved, _ = ComputeDynamicInteractiveReserve(310, 3, 15, 6, 100, 0)
+	if reserved != 100 {
+		t.Fatalf("capped reserved = %d, want 100", reserved)
+	}
+}
+
 func TestInteractiveDetectBytesValue(t *testing.T) {
 	u := Usenet{InteractiveDetectBytes: "8MB"}
 	if got := u.InteractiveDetectBytesValue(); got != 8<<20 {
