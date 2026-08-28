@@ -279,25 +279,25 @@ func (s *interactiveState) releaseStreamSlot() {
 	}
 }
 
-func (s *interactiveState) providerReserveSlots(providerMax, totalConnections int) int {
-	if s == nil || providerMax <= 0 || totalConnections <= 0 {
+func (s *interactiveState) providerStreamHeadroom(providerMax int) int {
+	if s == nil || providerMax <= 0 {
 		return 0
 	}
 	s.mu.RLock()
-	reserved := s.reserved
-	active := s.active && s.cfg.enabled
+	perStream := s.perStreamReserve
 	s.mu.RUnlock()
-	if !active || reserved <= 0 {
-		return 0
+	if perStream <= 0 {
+		perStream = 1
 	}
-	share := (providerMax * reserved) / totalConnections
-	if share < 1 {
-		share = 1
+	if perStream >= providerMax {
+		return providerMax - 1
 	}
-	if share > providerMax {
-		share = providerMax
-	}
-	return share
+	return perStream
+}
+
+func (s *interactiveState) providerReserveSlots(providerMax, totalConnections int) int {
+	_ = totalConnections
+	return s.providerStreamHeadroom(providerMax)
 }
 
 func (s *interactiveState) backgroundMayUseProvider(providerInUse, providerMax, totalConnections int) bool {
@@ -306,12 +306,14 @@ func (s *interactiveState) backgroundMayUseProvider(providerInUse, providerMax, 
 	}
 	s.mu.RLock()
 	active := s.active && s.cfg.enabled
-	reserved := s.reserved
 	s.mu.RUnlock()
-	if !active || reserved <= 0 {
+	if !active {
 		return true
 	}
-	headroom := s.providerReserveSlots(providerMax, totalConnections)
+	headroom := s.providerStreamHeadroom(providerMax)
+	if headroom <= 0 {
+		return true
+	}
 	return providerInUse < providerMax-headroom
 }
 

@@ -122,6 +122,20 @@ type Downloaders struct {
 	interactiveProbe atomic.Bool
 }
 
+// RecordPlaybackActivity keeps interactive reserve alive during cache-served reads.
+func (dls *Downloaders) RecordPlaybackActivity(bytesRead, off, readSize, fileSize int64) {
+	if dls == nil || dls.manager == nil || bytesRead <= 0 {
+		return
+	}
+	dls.mu.Lock()
+	streamID := dls.streamID
+	dls.mu.Unlock()
+	if streamID == "" {
+		return
+	}
+	dls.manager.RecordStreamActivity(streamID, bytesRead, 0, isProbeRead(off, readSize, fileSize))
+}
+
 // ensureStreamTrackedLocked makes sure the active stream is registered when
 // reads begin. Caller must hold dls.mu.
 func (dls *Downloaders) ensureStreamTrackedLocked() {

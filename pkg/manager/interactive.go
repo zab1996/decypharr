@@ -169,6 +169,19 @@ func (m *InteractiveMonitor) deactivateLocked() {
 	}
 }
 
+// touchQualifyingActivity refreshes idle keepalive without adding detect samples.
+func (m *InteractiveMonitor) touchQualifyingActivity() {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.enabled || !m.active {
+		return
+	}
+	m.lastQualifyingAt = time.Now()
+}
+
 func (m *InteractiveMonitor) pruneLocked(now time.Time) {
 	cutoff := now.Add(-m.detectWindow)
 	i := 0
@@ -316,6 +329,12 @@ func (m *Manager) interactiveMonitorLoop() {
 			return
 		case now := <-ticker.C:
 			if m.interactive != nil {
+				if m.interactiveProtectionEnabled() &&
+					m.PlexProtectedStreamCount() > 0 &&
+					m.interactive.Active() &&
+					m.hasBackgroundContention() {
+					m.interactive.touchQualifyingActivity()
+				}
 				m.interactive.Tick(now)
 				if m.interactive.Active() {
 					m.pushInteractiveStreamCount()

@@ -126,6 +126,27 @@ func TestRepairPoolInteractiveCap(t *testing.T) {
 	}
 }
 
+func TestProviderHeadroomUsesPerStreamReserve(t *testing.T) {
+	state := newInteractiveState(&config.Config{
+		Usenet: config.Usenet{
+			InteractivePoolReserveEnabled: true,
+			InteractivePoolReservePercent: 15,
+			InteractivePoolReserveMax:     100,
+		},
+	})
+	_, _, _, snap := state.setActive(true, 310, 1, reserveMeta{})
+	if snap.PerStreamReserve != 47 {
+		t.Fatalf("perStream = %d, want 47", snap.PerStreamReserve)
+	}
+	// Provider max 20: reserve 19 slots for playback, background capped at 1.
+	if !state.backgroundMayUseProvider(0, 20, 310) {
+		t.Fatal("background should be allowed below headroom")
+	}
+	if state.backgroundMayUseProvider(1, 20, 310) {
+		t.Fatal("background should be blocked once provider headroom is taken")
+	}
+}
+
 func TestProviderHeadroom(t *testing.T) {
 	state := newInteractiveState(&config.Config{
 		Usenet: config.Usenet{
