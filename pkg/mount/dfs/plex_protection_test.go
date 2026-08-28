@@ -8,8 +8,8 @@ import (
 
 func TestResolveProtectedStreamsSkipsInactiveSessions(t *testing.T) {
 	out := resolveProtectedStreams(nil, []plexSession{
-		{Type: "episode", Duration: 0, ViewOffset: 0, GrandparentTitle: "Show", ParentIndex: 1, Index: 1},
-		{Type: "movie", Duration: 0, ViewOffset: 500, Title: "Inception"},
+		{Type: "episode", Duration: 1000, ViewOffset: 0, GrandparentTitle: "Show", ParentIndex: 1, Index: 1},
+		{Type: "movie", Duration: 1000, ViewOffset: 500, Title: "Inception"},
 	})
 	if len(out) != 0 {
 		t.Fatalf("expected 0 protected streams, got %d", len(out))

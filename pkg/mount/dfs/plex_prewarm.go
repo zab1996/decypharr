@@ -320,16 +320,10 @@ func pollPlexSessionsOnce(ctx context.Context, client *http.Client, plexURL, ple
 	}
 
 	if protectionEnabled && mgr != nil {
-		before := mgr.PlexProtectedStreamCount()
 		protected := resolveProtectedStreams(mgr, sessions)
 		mgr.SetPlexProtectedStreams(protected)
-		switch {
-		case len(protected) > 0 && len(protected) != before:
-			log.Info().Int("sessions", len(sessions)).Int("protected", len(protected)).Msg("Plex: protected streams updated")
-		case len(sessions) > 0 && len(protected) == 0:
-			if shouldLogPlexUnmatched(time.Now()) {
-				log.Info().Int("sessions", len(sessions)).Msg("Plex: active sessions but no mount file match yet")
-			}
+		if len(protected) > 0 {
+			log.Debug().Int("count", len(protected)).Msg("Plex: updated protected streams")
 		}
 	}
 
@@ -428,21 +422,6 @@ func fetchPlexSessions(ctx context.Context, client *http.Client, plexURL, plexTo
 type prewarmedSessions struct {
 	mu      sync.Mutex
 	entries map[string]time.Time
-}
-
-var (
-	lastPlexUnmatchedLog time.Time
-	lastPlexUnmatchedMu  sync.Mutex
-)
-
-func shouldLogPlexUnmatched(now time.Time) bool {
-	lastPlexUnmatchedMu.Lock()
-	defer lastPlexUnmatchedMu.Unlock()
-	if !now.After(lastPlexUnmatchedLog.Add(time.Minute)) {
-		return false
-	}
-	lastPlexUnmatchedLog = now
-	return true
 }
 
 func (p *prewarmedSessions) markIfNew(key string) bool {
@@ -650,7 +629,7 @@ func resolveProtectedStreams(mgr *manager.Manager, sessions []plexSession) []man
 	seen := make(map[string]struct{})
 	out := make([]manager.PlexProtectedStream, 0, len(sessions))
 	for _, s := range sessions {
-		if s.Duration <= 0 {
+		if s.Duration <= 0 || s.ViewOffset <= 0 {
 			continue
 		}
 		switch s.Type {
@@ -690,34 +669,6 @@ func resolveCurrentPlayingFile(mgr *manager.Manager, s plexSession) *manager.Fil
 	if basename := s.sessionBasename(); basename != "" {
 		if file := findFileByBasename(mgr, basename); file != nil {
 			return file
-		}
-		// Plex often reports cli_debrid symlink names, not the release filename
-		// tracked in cli_mount. Parse SxxExx/title out of the symlink basename.
-		parsed := utils.ParseTorrentName(basename)
-		if parsed.IsTV && parsed.Season > 0 && parsed.EpStart > 0 {
-			title := parsed.Title
-			if title == "" {
-				title = s.GrandparentTitle
-			}
-			if file := findEpisode(mgr, title, parsed.Season, parsed.EpStart); file != nil {
-				return file
-			}
-		}
-		if !parsed.IsTV {
-			title := parsed.Title
-			if title == "" {
-				title = s.Title
-			}
-			year := 0
-			if parsed.Year != "" {
-				fmt.Sscanf(parsed.Year, "%d", &year)
-			}
-			if year == 0 {
-				year = s.Year
-			}
-			if file := findMovie(mgr, title, year); file != nil {
-				return file
-			}
 		}
 	}
 	switch s.Type {
