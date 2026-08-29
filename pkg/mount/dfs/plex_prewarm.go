@@ -446,8 +446,9 @@ func shouldLogPlexUnmatched(now time.Time) bool {
 }
 
 // mountBasenameCandidates returns Plex-reported basenames to try against the
-// mount. cli_debrid symlinks use friendly names with the release filename in
-// trailing parentheses, e.g. "Shrek 2 (2004) - tt0298148 - 1080p - (Release.mkv)".
+// mount. The original basename is always tried first (direct mount / release
+// filename libraries). cli_debrid symlinks add a second candidate extracted
+// from trailing parentheses, e.g. "Shrek 2 (2004) - tt... - (Release.mkv)".
 func mountBasenameCandidates(plexBasename string) []string {
 	if plexBasename == "" {
 		return nil
@@ -705,6 +706,11 @@ func resolveProtectedStreams(mgr *manager.Manager, sessions []plexSession) []man
 }
 
 func resolveCurrentPlayingFile(mgr *manager.Manager, s plexSession) *manager.FileInfo {
+	// Matching tries several strategies in order; all paths remain active:
+	//  1. Exact basename — Plex points at mount/release filename (no symlinks)
+	//  2. Symlink release name — cli_debrid "(Release.mkv)" in trailing parens
+	//  3. Parse Plex basename — title/year or SxxExx from symlink-style names
+	//  4. Plex metadata — findMovie(title,year) / findEpisode(show,S,E) fallback
 	for _, basename := range mountBasenameCandidates(s.sessionBasename()) {
 		if file := findFileByBasename(mgr, basename); file != nil {
 			return file

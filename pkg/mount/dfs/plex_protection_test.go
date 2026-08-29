@@ -16,6 +16,14 @@ func TestResolveProtectedStreamsSkipsInactiveSessions(t *testing.T) {
 	}
 }
 
+func TestMountBasenameCandidatesKeepsDirectMountName(t *testing.T) {
+	release := "Shrek.2.2004.NORDiC.1080p.WEB-DL.H.264.DDP5.1-NoTrace.mkv"
+	got := mountBasenameCandidates(release)
+	if len(got) != 1 || got[0] != release {
+		t.Fatalf("direct mount candidates = %v, want [%q]", got, release)
+	}
+}
+
 func TestMountBasenameCandidatesExtractsCliDebridSymlink(t *testing.T) {
 	symlink := "Shrek 2 (2004) - tt0298148 - 1080p - (Shrek.2.2004.NORDiC.1080p.WEB-DL.H.264.DDP5.1-NoTrace.mkv"
 	got := mountBasenameCandidates(symlink)
