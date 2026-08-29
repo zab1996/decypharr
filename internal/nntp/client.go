@@ -275,7 +275,6 @@ func NewClient(cfg *config.Config, metricStores ...*hybrid.Store) (*Client, erro
 	}
 	cm.repairPool = cm.newRepairPool(cfg.Repair.NNTPConnectionPercent)
 	cm.interactive = newInteractiveState(cfg)
-	cm.logInteractiveConfig(cfg)
 	var metricStore *hybrid.Store
 	if len(metricStores) > 0 {
 		metricStore = metricStores[0]
