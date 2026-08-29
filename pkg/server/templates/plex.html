@@ -89,12 +89,12 @@
                     <div id="playbackProtectionFields" class="hidden space-y-4">
                         <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                             <div class="form-control">
-                                <label class="label" for="connectionsPerStream">
-                                    <span class="label-text font-medium">Connections per Plex stream</span>
+                                <label class="label" for="reservePercent">
+                                    <span class="label-text font-medium">Per-stream reserve (% of pool)</span>
                                 </label>
-                                <input type="number" id="connectionsPerStream" class="input input-bordered w-full" min="0" placeholder="auto" />
+                                <input type="number" id="reservePercent" class="input input-bordered w-full" min="1" max="100" placeholder="15" />
                                 <label class="label">
-                                    <span class="label-text-alt opacity-60">0 = auto from percent below</span>
+                                    <span class="label-text-alt opacity-60">Each Plex stream reserves round(total × percent ÷ 100) connections (min 6), capped by max total protected.</span>
                                 </label>
                             </div>
                             <div class="form-control">
@@ -102,6 +102,33 @@
                                     <span class="label-text font-medium">Max total protected</span>
                                 </label>
                                 <input type="number" id="maxTotalProtected" class="input input-bordered w-full" min="1" placeholder="40" />
+                            </div>
+                            <div class="form-control">
+                                <label class="label" for="detectBytes">
+                                    <span class="label-text font-medium">Detect bytes</span>
+                                </label>
+                                <input type="text" id="detectBytes" class="input input-bordered w-full" placeholder="4MB" />
+                                <label class="label">
+                                    <span class="label-text-alt opacity-60">Qualifying read volume before reserve can activate.</span>
+                                </label>
+                            </div>
+                            <div class="form-control">
+                                <label class="label" for="detectWindow">
+                                    <span class="label-text font-medium">Detect window</span>
+                                </label>
+                                <input type="text" id="detectWindow" class="input input-bordered w-full" placeholder="5s" />
+                                <label class="label">
+                                    <span class="label-text-alt opacity-60">Sliding window for sustained-read detection.</span>
+                                </label>
+                            </div>
+                            <div class="form-control">
+                                <label class="label" for="idleTimeout">
+                                    <span class="label-text font-medium">Idle timeout</span>
+                                </label>
+                                <input type="text" id="idleTimeout" class="input input-bordered w-full" placeholder="30s" />
+                                <label class="label">
+                                    <span class="label-text-alt opacity-60">Exit reserve mode after no qualifying reads.</span>
+                                </label>
                             </div>
                         </div>
 
@@ -111,39 +138,6 @@
                                 <span class="label-text font-medium">Pre-cache on open (throttled as background while protection is active)</span>
                             </label>
                         </div>
-
-                        <details class="collapse collapse-arrow bg-base-200/50 rounded-box">
-                            <summary class="collapse-title text-sm font-medium">Advanced detection settings</summary>
-                            <div class="collapse-content grid grid-cols-1 md:grid-cols-2 gap-4 pt-2">
-                                <div class="form-control">
-                                    <label class="label" for="autoPercent">
-                                        <span class="label-text font-medium">Auto per-stream reserve (% of pool)</span>
-                                    </label>
-                                    <input type="number" id="autoPercent" class="input input-bordered w-full" min="1" max="100" placeholder="15" />
-                                    <label class="label">
-                                        <span class="label-text-alt opacity-60">Used when connections per stream is 0. Each Plex stream gets round(total × percent ÷ 100) connections (min 6), capped by max total protected.</span>
-                                    </label>
-                                </div>
-                                <div class="form-control">
-                                    <label class="label" for="detectBytes">
-                                        <span class="label-text font-medium">Detect bytes</span>
-                                    </label>
-                                    <input type="text" id="detectBytes" class="input input-bordered w-full" placeholder="4MB" />
-                                </div>
-                                <div class="form-control">
-                                    <label class="label" for="detectWindow">
-                                        <span class="label-text font-medium">Detect window</span>
-                                    </label>
-                                    <input type="text" id="detectWindow" class="input input-bordered w-full" placeholder="5s" />
-                                </div>
-                                <div class="form-control">
-                                    <label class="label" for="idleTimeout">
-                                        <span class="label-text font-medium">Idle timeout</span>
-                                    </label>
-                                    <input type="text" id="idleTimeout" class="input input-bordered w-full" placeholder="30s" />
-                                </div>
-                            </div>
-                        </details>
 
                         <p id="playbackProtectionHint" class="text-sm opacity-70"></p>
                     </div>
@@ -172,10 +166,7 @@
         }, 0);
     }
 
-    function computePerStreamBase(total, percent, min, perStreamOverride) {
-        if (perStreamOverride > 0) {
-            return perStreamOverride;
-        }
+    function computePerStreamBase(total, percent, min) {
         if (total <= 0) {
             return min;
         }
@@ -183,8 +174,8 @@
         return Math.max(min, computed);
     }
 
-    function computeDynamicReserve(total, streams, percent, min, max, perStreamOverride) {
-        const perStream = computePerStreamBase(total, percent, min, perStreamOverride);
+    function computeDynamicReserve(total, streams, percent, min, max) {
+        const perStream = computePerStreamBase(total, percent, min);
         let reserved = perStream * streams;
         if (reserved < min) {
             reserved = min;
@@ -211,18 +202,17 @@
         }
         const usenet = currentConfig.usenet || {};
         const total = sumProviderConnections(usenet);
-        const percent = parseInt(document.getElementById('autoPercent').value, 10) || 15;
+        const percent = parseInt(document.getElementById('reservePercent').value, 10) || 15;
         const max = parseInt(document.getElementById('maxTotalProtected').value, 10) || 40;
-        const perStreamOverride = parseInt(document.getElementById('connectionsPerStream').value, 10) || 0;
         if (!total) {
             hint.textContent = 'Add NNTP providers in Settings to preview protection sizing.';
             return;
         }
         const preview = [1, 2, 3].map((streams) => {
-            const snap = computeDynamicReserve(total, streams, percent, 6, max, perStreamOverride);
+            const snap = computeDynamicReserve(total, streams, percent, 6, max);
             return `${streams} Plex stream${streams > 1 ? 's' : ''} → ${snap.reserved} protected / ${snap.background} background`;
         });
-        const perStream = computePerStreamBase(total, percent, 6, perStreamOverride);
+        const perStream = computePerStreamBase(total, percent, 6);
         hint.textContent = `With ${total} configured connections (~${perStream} per stream): ${preview.join(' | ')}`;
     }
 
@@ -236,10 +226,9 @@
         document.getElementById('plexToken').value = dfs.plex_token || '';
         document.getElementById('plexMaxSize').value = dfs.prewarm_max_size || '';
         document.getElementById('playbackProtectionEnabled').checked = !!usenet.interactive_pool_reserve_enabled;
-        document.getElementById('connectionsPerStream').value = usenet.interactive_pool_reserve_per_stream || '';
         document.getElementById('maxTotalProtected').value = usenet.interactive_pool_reserve_max || '';
         document.getElementById('preCacheOnOpen').checked = !!usenet.pre_cache_on_open;
-        document.getElementById('autoPercent').value = usenet.interactive_pool_reserve_percent || 15;
+        document.getElementById('reservePercent').value = usenet.interactive_pool_reserve_percent || 15;
         document.getElementById('detectBytes').value = usenet.interactive_detect_bytes || '4MB';
         document.getElementById('detectWindow').value = usenet.interactive_detect_window || '5s';
         document.getElementById('idleTimeout').value = usenet.interactive_idle_timeout || '30s';
@@ -252,7 +241,7 @@
     loadConfig();
 
     document.getElementById('playbackProtectionEnabled').addEventListener('change', updatePlaybackProtectionUI);
-    ['connectionsPerStream', 'maxTotalProtected', 'autoPercent'].forEach((id) => {
+    ['maxTotalProtected', 'reservePercent'].forEach((id) => {
         document.getElementById(id).addEventListener('input', updatePlaybackProtectionHint);
     });
 
@@ -271,9 +260,9 @@
 
             cfg.usenet = cfg.usenet || {};
             cfg.usenet.interactive_pool_reserve_enabled = document.getElementById('playbackProtectionEnabled').checked;
-            cfg.usenet.interactive_pool_reserve_per_stream = parseInt(document.getElementById('connectionsPerStream').value, 10) || 0;
+            cfg.usenet.interactive_pool_reserve_per_stream = 0;
             cfg.usenet.interactive_pool_reserve_max = parseInt(document.getElementById('maxTotalProtected').value, 10) || 40;
-            cfg.usenet.interactive_pool_reserve_percent = parseInt(document.getElementById('autoPercent').value, 10) || 15;
+            cfg.usenet.interactive_pool_reserve_percent = parseInt(document.getElementById('reservePercent').value, 10) || 15;
             cfg.usenet.interactive_pool_reserve_min = cfg.usenet.interactive_pool_reserve_min || 6;
             cfg.usenet.pre_cache_on_open = document.getElementById('preCacheOnOpen').checked;
             cfg.usenet.interactive_detect_bytes = document.getElementById('detectBytes').value.trim() || '4MB';

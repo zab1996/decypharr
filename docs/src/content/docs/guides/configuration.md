@@ -118,7 +118,6 @@ Array of Debrid services:
     "read_ahead": "16MB",
     "pre_cache_on_open": false,
     "interactive_pool_reserve_enabled": false,
-    "interactive_pool_reserve_per_stream": 0,
     "interactive_pool_reserve_percent": 15,
     "interactive_pool_reserve_min": 6,
     "interactive_pool_reserve_max": 40,
@@ -143,8 +142,7 @@ Array of Debrid services:
 | `read_ahead`                  | string | Prefetch buffer size            | `16MB`                       |
 | `pre_cache_on_open`           | bool   | Fetch the head and tail when a Usenet file is opened; throttled as background work while playback protection is active | `false` |
 | `interactive_pool_reserve_enabled` | bool | Plex-gated playback protection (configured on the Plex page). When enabled with Plex URL/token, reserves NNTP capacity per confirmed Plex session **only while bulk imports are also running**. Playback alone uses the full pool. | `false` |
-| `interactive_pool_reserve_per_stream` | int | Connections reserved per Plex stream (0 = auto from percent) | `0` |
-| `interactive_pool_reserve_percent` | int | Auto per-stream baseline as percent of total pool when per-stream is 0 | `15` |
+| `interactive_pool_reserve_percent` | int | Per-stream reserve as percent of total pool (configured on the Plex page) | `15` |
 | `interactive_pool_reserve_min` | int | Minimum total reserve floor (small pools) | `6` |
 | `interactive_pool_reserve_max` | int | Maximum total protected connections across all Plex streams | `40` |
 | `interactive_detect_bytes` | string | Qualifying bytes in the detect window before reserve can activate (requires Plex playback + background imports) | `4MB` |
