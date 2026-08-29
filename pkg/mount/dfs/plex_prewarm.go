@@ -320,10 +320,16 @@ func pollPlexSessionsOnce(ctx context.Context, client *http.Client, plexURL, ple
 	}
 
 	if protectionEnabled && mgr != nil {
+		before := mgr.PlexProtectedStreamCount()
 		protected := resolveProtectedStreams(mgr, sessions)
 		mgr.SetPlexProtectedStreams(protected)
-		if len(protected) > 0 {
-			log.Debug().Int("count", len(protected)).Msg("Plex: updated protected streams")
+		switch {
+		case len(protected) > 0 && len(protected) != before:
+			log.Info().Int("sessions", len(sessions)).Int("protected", len(protected)).Msg("Plex: protected streams updated")
+		case len(sessions) > 0 && len(protected) == 0:
+			if shouldLogPlexUnmatched(time.Now()) {
+				log.Info().Int("sessions", len(sessions)).Msg("Plex: active sessions but no mount file match yet")
+			}
 		}
 	}
 
@@ -422,6 +428,39 @@ func fetchPlexSessions(ctx context.Context, client *http.Client, plexURL, plexTo
 type prewarmedSessions struct {
 	mu      sync.Mutex
 	entries map[string]time.Time
+}
+
+var (
+	lastPlexUnmatchedLog time.Time
+	lastPlexUnmatchedMu  sync.Mutex
+)
+
+func shouldLogPlexUnmatched(now time.Time) bool {
+	lastPlexUnmatchedMu.Lock()
+	defer lastPlexUnmatchedMu.Unlock()
+	if !now.After(lastPlexUnmatchedLog.Add(time.Minute)) {
+		return false
+	}
+	lastPlexUnmatchedLog = now
+	return true
+}
+
+// mountBasenameCandidates returns Plex-reported basenames to try against the
+// mount. cli_debrid symlinks use friendly names with the release filename in
+// trailing parentheses, e.g. "Shrek 2 (2004) - tt0298148 - 1080p - (Release.mkv)".
+func mountBasenameCandidates(plexBasename string) []string {
+	if plexBasename == "" {
+		return nil
+	}
+	candidates := []string{plexBasename}
+	if i := strings.LastIndex(plexBasename, "("); i >= 0 {
+		inner := strings.TrimSpace(plexBasename[i+1:])
+		inner = strings.TrimSuffix(inner, ")")
+		if inner != "" && strings.Contains(inner, ".") {
+			candidates = append(candidates, inner)
+		}
+	}
+	return candidates
 }
 
 func (p *prewarmedSessions) markIfNew(key string) bool {
@@ -629,7 +668,7 @@ func resolveProtectedStreams(mgr *manager.Manager, sessions []plexSession) []man
 	seen := make(map[string]struct{})
 	out := make([]manager.PlexProtectedStream, 0, len(sessions))
 	for _, s := range sessions {
-		if s.Duration <= 0 || s.ViewOffset <= 0 {
+		if s.Duration <= 0 {
 			continue
 		}
 		switch s.Type {
@@ -666,9 +705,39 @@ func resolveProtectedStreams(mgr *manager.Manager, sessions []plexSession) []man
 }
 
 func resolveCurrentPlayingFile(mgr *manager.Manager, s plexSession) *manager.FileInfo {
-	if basename := s.sessionBasename(); basename != "" {
+	for _, basename := range mountBasenameCandidates(s.sessionBasename()) {
 		if file := findFileByBasename(mgr, basename); file != nil {
 			return file
+		}
+	}
+	if basename := s.sessionBasename(); basename != "" {
+		// Plex often reports cli_debrid symlink names, not the release filename
+		// tracked in cli_mount. Parse SxxExx/title out of the symlink basename.
+		parsed := utils.ParseTorrentName(basename)
+		if parsed.IsTV && parsed.Season > 0 && parsed.EpStart > 0 {
+			title := parsed.Title
+			if title == "" {
+				title = s.GrandparentTitle
+			}
+			if file := findEpisode(mgr, title, parsed.Season, parsed.EpStart); file != nil {
+				return file
+			}
+		}
+		if !parsed.IsTV {
+			title := parsed.Title
+			if title == "" {
+				title = s.Title
+			}
+			year := 0
+			if parsed.Year != "" {
+				fmt.Sscanf(parsed.Year, "%d", &year)
+			}
+			if year == 0 {
+				year = s.Year
+			}
+			if file := findMovie(mgr, title, year); file != nil {
+				return file
+			}
 		}
 	}
 	switch s.Type {
