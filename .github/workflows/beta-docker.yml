@@ -1,34 +1,33 @@
-name: Beta Build
+name: Dev Build
 
 on:
   push:
     branches:
-      - beta
+      - dev
 
 permissions:
   contents: write
   packages: write
 
 env:
-  GHCR_IMAGE: ghcr.io/mash2k3/decypharr
+  GHCR_IMAGE: ghcr.io/mash2k3/cli_mount
   LDFLAGS_PKG: github.com/sirrobot01/decypharr/pkg/version
 
 jobs:
   prepare:
     runs-on: ubuntu-latest
     outputs:
-      beta_version: ${{ steps.meta.outputs.beta_version }}
+      dev_version: ${{ steps.meta.outputs.dev_version }}
     steps:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
-      - name: Calculate beta version
+      - name: Calculate dev version
         id: meta
         run: |
-          LATEST_TAG=$(git tag | grep -v 'beta' | sort -V | tail -n1)
-          BETA_VERSION="${LATEST_TAG:-0.0.0}-beta+$(git rev-parse --short HEAD)"
-          echo "beta_version=${BETA_VERSION}" >> $GITHUB_OUTPUT
+          DEV_VERSION=$(grep -oP 'Version = "\K[^"]+' pkg/version/version.go)
+          echo "dev_version=${DEV_VERSION}" >> $GITHUB_OUTPUT
 
   build-linux:
     runs-on: ubuntu-latest
@@ -63,23 +62,23 @@ jobs:
           GOARCH: ${{ matrix.arch }}
           CC: ${{ matrix.cc }}
           CXX: ${{ matrix.cxx }}
-          VERSION: ${{ needs.prepare.outputs.beta_version }}
-          CHANNEL: beta
+          VERSION: ${{ needs.prepare.outputs.dev_version }}
+          CHANNEL: dev
         run: |
           mkdir -p dist
           go build -trimpath \
             -ldflags="-s -w -X ${LDFLAGS_PKG}.Version=${VERSION} -X ${LDFLAGS_PKG}.Channel=${CHANNEL}" \
-            -o dist/decypharr
+            -o dist/cli_mount
       - name: Package
         run: |
           ARCH="${{ matrix.arch }}"
           [ "$ARCH" = "amd64" ] && ARCH="x86_64"
-          tar czf "dist/decypharr_Linux_${ARCH}.tar.gz" -C dist decypharr
+          tar czf "dist/cli_mount_Linux_${ARCH}.tar.gz" -C dist cli_mount
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: linux-${{ matrix.arch }}
-          path: dist/decypharr_Linux_*.tar.gz
+          path: dist/cli_mount_Linux_*.tar.gz
           retention-days: 7
 
   build-windows:
@@ -97,21 +96,21 @@ jobs:
           CGO_ENABLED: 0
           GOOS: windows
           GOARCH: amd64
-          VERSION: ${{ needs.prepare.outputs.beta_version }}
-          CHANNEL: beta
+          VERSION: ${{ needs.prepare.outputs.dev_version }}
+          CHANNEL: dev
         run: |
           mkdir -p dist
           go build -trimpath \
             -ldflags="-s -w -X ${LDFLAGS_PKG}.Version=${VERSION} -X ${LDFLAGS_PKG}.Channel=${CHANNEL}" \
-            -o dist/decypharr.exe
+            -o dist/cli_mount.exe
       - name: Package
         working-directory: dist
-        run: zip decypharr_Windows_x86_64.zip decypharr.exe
+        run: zip cli_mount_Windows_x86_64.zip cli_mount.exe
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: windows-amd64
-          path: dist/decypharr_Windows_x86_64.zip
+          path: dist/cli_mount_Windows_x86_64.zip
           retention-days: 7
 
   build-darwin:
@@ -138,20 +137,20 @@ jobs:
           CGO_ENABLED: 1
           GOOS: darwin
           GOARCH: ${{ matrix.arch }}
-          VERSION: ${{ needs.prepare.outputs.beta_version }}
-          CHANNEL: beta
+          VERSION: ${{ needs.prepare.outputs.dev_version }}
+          CHANNEL: dev
         run: |
           mkdir -p dist
           go build -trimpath \
             -ldflags="-s -w -X ${LDFLAGS_PKG}.Version=${VERSION} -X ${LDFLAGS_PKG}.Channel=${CHANNEL}" \
-            -o dist/decypharr
+            -o dist/cli_mount
       - name: Package
-        run: tar czf "dist/decypharr_Darwin_${{ matrix.label }}.tar.gz" -C dist decypharr
+        run: tar czf "dist/cli_mount_Darwin_${{ matrix.label }}.tar.gz" -C dist cli_mount
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: darwin-${{ matrix.arch }}
-          path: dist/decypharr_Darwin_*.tar.gz
+          path: dist/cli_mount_Darwin_*.tar.gz
           retention-days: 7
 
   docker:
@@ -185,8 +184,8 @@ jobs:
           context: .
           platforms: ${{ matrix.platform }}
           build-args: |
-            VERSION=${{ needs.prepare.outputs.beta_version }}
-            CHANNEL=beta
+            VERSION=${{ needs.prepare.outputs.dev_version }}
+            CHANNEL=dev
           cache-from: type=gha,scope=build-${{ env.PLATFORM_PAIR }}
           cache-to: type=gha,scope=build-${{ env.PLATFORM_PAIR }},mode=max
           outputs: type=image,name=${{ env.GHCR_IMAGE }},push-by-digest=true,name-canonical=true,push=true
@@ -225,7 +224,7 @@ jobs:
         working-directory: /tmp/digests/ghcr
         run: |
           docker buildx imagetools create \
-            --tag ${{ env.GHCR_IMAGE }}:beta \
+            --tag ${{ env.GHCR_IMAGE }}:dev \
             $(printf '${{ env.GHCR_IMAGE }}@sha256:%s ' *)
 
   release:
@@ -260,16 +259,17 @@ jobs:
         with:
           name: darwin-arm64
           path: dist
-      - name: Create or update beta release
+      - name: Create versioned dev release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERSION: ${{ needs.prepare.outputs.beta_version }}
+          VERSION: ${{ needs.prepare.outputs.dev_version }}
         run: |
-          if gh release view "beta" &>/dev/null; then
-            gh release upload "beta" dist/* --clobber
-          else
-            gh release create "beta" dist/* \
-              --title "decypharr beta" \
-              --prerelease \
-              --notes "Latest beta build from the beta branch."
-          fi
+          TAG="dev-${VERSION}"
+          # Delete previous dev-* releases to keep only the latest
+          gh release list --limit 20 | awk '{print $1}' | grep '^dev-' | while read OLD_TAG; do
+            gh release delete "$OLD_TAG" --yes --cleanup-tag 2>/dev/null || true
+          done
+          gh release create "$TAG" dist/* \
+            --title "cli_mount dev ${VERSION}" \
+            --prerelease \
+            --notes "Latest dev build from the dev branch."

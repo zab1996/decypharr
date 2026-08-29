@@ -2,8 +2,6 @@ name: Release
 
 on:
   push:
-    branches:
-      - main
     tags:
       - 'v*'
 
@@ -12,7 +10,7 @@ permissions:
   packages: write
 
 env:
-  REGISTRY_GHCR: ghcr.io/mash2k3/decypharr
+  REGISTRY_GHCR: ghcr.io/mash2k3/cli_mount
   LDFLAGS_PKG: github.com/sirrobot01/decypharr/pkg/version
 
 jobs:
@@ -21,34 +19,20 @@ jobs:
     outputs:
       version: ${{ steps.meta.outputs.version }}
       channel: ${{ steps.meta.outputs.channel }}
-      tag: ${{ steps.meta.outputs.tag }}
     steps:
-      - uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
-
       - name: Extract version and channel
         id: meta
         run: |
-          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
-            TAG="${GITHUB_REF#refs/tags/}"
-            VERSION="${TAG#v}"
-            if [[ "$TAG" == *"-beta"* ]]; then
-              CHANNEL="beta"
-            elif [[ "$TAG" == *"-rc"* ]]; then
-              CHANNEL="rc"
-            else
-              CHANNEL="stable"
-            fi
-          else
-            # Push to main — use rolling "latest" release
-            TAG="latest"
-            VERSION="$(git describe --tags --abbrev=0 2>/dev/null || echo '0.0.0')-dev+$(git rev-parse --short HEAD)"
-            CHANNEL="stable"
-          fi
-          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          TAG="${GITHUB_REF#refs/tags/}"
+          VERSION="${TAG#v}"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "channel=${CHANNEL}" >> "$GITHUB_OUTPUT"
+          if [[ "$TAG" == *"-beta"* ]]; then
+            echo "channel=beta" >> "$GITHUB_OUTPUT"
+          elif [[ "$TAG" == *"-rc"* ]]; then
+            echo "channel=rc" >> "$GITHUB_OUTPUT"
+          else
+            echo "channel=stable" >> "$GITHUB_OUTPUT"
+          fi
 
   build-linux:
     runs-on: ubuntu-latest
@@ -93,20 +77,19 @@ jobs:
           mkdir -p dist
           go build -trimpath \
             -ldflags="-s -w -X ${LDFLAGS_PKG}.Version=${VERSION} -X ${LDFLAGS_PKG}.Channel=${CHANNEL}" \
-            -o dist/decypharr
+            -o dist/cli_mount
 
       - name: Package
         run: |
           ARCH="${{ matrix.arch }}"
           [ "$ARCH" = "amd64" ] && ARCH="x86_64"
-          tar czf "dist/decypharr_Linux_${ARCH}.tar.gz" -C dist decypharr
+          tar czf "dist/cli_mount_Linux_${ARCH}.tar.gz" -C dist cli_mount
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: linux-${{ matrix.arch }}
-          path: dist/decypharr_Linux_*.tar.gz
-          retention-days: 7
+          path: dist/cli_mount_Linux_*.tar.gz
 
   build-windows:
     runs-on: ubuntu-latest
@@ -131,18 +114,17 @@ jobs:
           mkdir -p dist
           go build -trimpath \
             -ldflags="-s -w -X ${LDFLAGS_PKG}.Version=${VERSION} -X ${LDFLAGS_PKG}.Channel=${CHANNEL}" \
-            -o dist/decypharr.exe
+            -o dist/cli_mount.exe
 
       - name: Package
         working-directory: dist
-        run: zip decypharr_Windows_x86_64.zip decypharr.exe
+        run: zip cli_mount_Windows_x86_64.zip cli_mount.exe
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: windows-amd64
-          path: dist/decypharr_Windows_x86_64.zip
-          retention-days: 7
+          path: dist/cli_mount_Windows_x86_64.zip
 
   build-darwin:
     runs-on: macos-latest
@@ -177,17 +159,16 @@ jobs:
           mkdir -p dist
           go build -trimpath \
             -ldflags="-s -w -X ${LDFLAGS_PKG}.Version=${VERSION} -X ${LDFLAGS_PKG}.Channel=${CHANNEL}" \
-            -o dist/decypharr
+            -o dist/cli_mount
 
       - name: Package
-        run: tar czf "dist/decypharr_Darwin_${{ matrix.label }}.tar.gz" -C dist decypharr
+        run: tar czf "dist/cli_mount_Darwin_${{ matrix.label }}.tar.gz" -C dist cli_mount
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: darwin-${{ matrix.arch }}
-          path: dist/decypharr_Darwin_*.tar.gz
-          retention-days: 7
+          path: dist/cli_mount_Darwin_*.tar.gz
 
   docker:
     runs-on: ubuntu-latest
@@ -218,7 +199,7 @@ jobs:
             VERSION=${{ needs.prepare.outputs.version }}
             CHANNEL=${{ needs.prepare.outputs.channel }}
           tags: |
-            ${{ env.REGISTRY_GHCR }}:${{ needs.prepare.outputs.tag }}
+            ${{ env.REGISTRY_GHCR }}:${{ github.ref_name }}
             ${{ env.REGISTRY_GHCR }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
@@ -231,54 +212,25 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Download linux-amd64
+      - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
-          name: linux-amd64
           path: dist
+          merge-multiple: true
 
-      - name: Download linux-arm64
-        uses: actions/download-artifact@v4
-        with:
-          name: linux-arm64
-          path: dist
-
-      - name: Download windows-amd64
-        uses: actions/download-artifact@v4
-        with:
-          name: windows-amd64
-          path: dist
-
-      - name: Download darwin-amd64
-        uses: actions/download-artifact@v4
-        with:
-          name: darwin-amd64
-          path: dist
-
-      - name: Download darwin-arm64
-        uses: actions/download-artifact@v4
-        with:
-          name: darwin-arm64
-          path: dist
-
-      - name: Create or update release
+      - name: Create release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ needs.prepare.outputs.tag }}
+          TAG: ${{ github.ref_name }}
           CHANNEL: ${{ needs.prepare.outputs.channel }}
-          VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           PRERELEASE=""
           if [ "$CHANNEL" != "stable" ]; then
             PRERELEASE="--prerelease"
           fi
 
-          if gh release view "$TAG" &>/dev/null; then
-            gh release upload "$TAG" dist/* --clobber
-          else
-            gh release create "$TAG" dist/* \
-              --title "decypharr ${VERSION}" \
-              --generate-notes \
-              $PRERELEASE \
-              --notes-start-tag "$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")"
-          fi
+          gh release create "$TAG" dist/* \
+            --title "cli_mount ${TAG}" \
+            --generate-notes \
+            $PRERELEASE \
+            --notes-start-tag "$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || echo "")"

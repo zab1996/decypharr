@@ -1,27 +1,79 @@
 package server
 
 import (
+	"bufio"
+	"bytes"
+	"compress/gzip"
 	"context"
+	"embed"
 	"errors"
 	"fmt"
+	"html/template"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/gorilla/sessions"
 	"github.com/rs/zerolog"
 	"github.com/sirrobot01/decypharr/internal/config"
 	"github.com/sirrobot01/decypharr/internal/logger"
+	"github.com/sirrobot01/decypharr/pkg/manager"
+	"github.com/sirrobot01/decypharr/pkg/server/qbit"
+	"github.com/sirrobot01/decypharr/pkg/server/sabnzbd"
+	"github.com/sirrobot01/decypharr/pkg/server/webdav"
+	"github.com/sirrobot01/decypharr/pkg/stats"
 )
 
-type Server struct {
-	router *chi.Mux
-	logger zerolog.Logger
+//go:embed templates/*
+var content embed.FS
+
+//go:embed assets/build/*
+var assetsEmbed embed.FS
+
+//go:embed assets/images/*
+var imagesEmbed embed.FS
+
+type AddRequest struct {
+	Url        string   `json:"url"`
+	Arr        string   `json:"arr"`
+	File       string   `json:"file"`
+	NotSymlink bool     `json:"notSymlink"`
+	Content    string   `json:"content"`
+	Seasons    []string `json:"seasons"`
+	Episodes   []string `json:"episodes"`
 }
 
-func New(handlers map[string]http.Handler) *Server {
+type ArrResponse struct {
+	Name string `json:"name"`
+	Url  string `json:"url"`
+}
+
+type ContentResponse struct {
+	ID    string `json:"id"`
+	Title string `json:"title"`
+	Type  string `json:"type"`
+	ArrID string `json:"arr"`
+}
+
+type Server struct {
+	router       *chi.Mux
+	logger       zerolog.Logger
+	manager      *manager.Manager
+	stats        *stats.Collector
+	cookie       *sessions.CookieStore
+	templates    *template.Template
+	nzbUserAgent string
+	urlBase      string
+	restartFunc  func()
+}
+
+func New(mgr *manager.Manager) *Server {
 	l := logger.New("http")
 	r := chi.NewRouter()
 	r.Use(middleware.Recoverer)
@@ -30,36 +82,105 @@ func New(handlers map[string]http.Handler) *Server {
 
 	cfg := config.Get()
 
-	s := &Server{
-		logger: l,
+	templates := template.Must(template.ParseFS(
+		content,
+		"templates/layout.html",
+		"templates/setup_layout.html",
+		"templates/index.html",
+		"templates/download.html",
+		"templates/repair.html",
+		"templates/plex.html",
+		"templates/stats.html",
+		"templates/config.html",
+		"templates/browse.html",
+		"templates/login.html",
+		"templates/register.html",
+		"templates/setup.html",
+		"templates/logs.html",
+	))
+	cookieStore := sessions.NewCookieStore([]byte(cfg.SecretKey()))
+	cookieStore.Options = &sessions.Options{
+		Path:     "/",
+		MaxAge:   86400 * 7,
+		HttpOnly: false,
 	}
 
-	r.Route(cfg.URLBase, func(r chi.Router) {
-		for pattern, handler := range handlers {
-			r.Mount(pattern, handler)
+	statsCollector := stats.New(mgr)
+
+	s := &Server{
+		logger:    l,
+		manager:   mgr,
+		stats:     statsCollector,
+		cookie:    cookieStore,
+		templates: templates,
+		urlBase:   cfg.URLBase,
+	}
+
+	qb := qbit.New(mgr)
+	sb := sabnzbd.New(mgr)
+	wd := webdav.NewHandler(mgr)
+
+	routes := make(map[string]http.Handler)
+	routes["/api/v2"] = qb.Routes()
+
+	if !wd.IsDisabled() {
+		routes["/webdav"] = wd.Routes()
+	}
+	routes["/sabnzbd"] = sb.Routes()
+
+	// Trim trailing slash so chi registers the URLBase root path itself
+	routePath := cfg.URLBase
+	if routePath != "/" {
+		routePath = strings.TrimSuffix(routePath, "/")
+	}
+	r.Route(routePath, func(r chi.Router) {
+		// Mount web routes
+		r.Mount("/", s.WebRoutes())
+
+		for path, handler := range routes {
+			r.Mount(path, handler)
 		}
 
-		//logs
-		r.Get("/logs", s.getLogs) // deprecated, use /debug/logs
+		r.Group(func(r chi.Router) {
+			r.Use(s.authMiddleware)
 
-		r.Route("/debug", func(r chi.Router) {
-			r.Get("/stats", s.handleStats)
-			r.Get("/logs", s.getLogs)
-			r.Get("/logs/rclone", s.getRcloneLogs)
-			r.Get("/ingests", s.handleIngests)
-			r.Get("/ingests/{debrid}", s.handleIngestsByDebrid)
+			r.Route("/debug", func(r chi.Router) {
+				r.Get("/stats", s.stats.Handler())
+				r.Post("/speedtest", s.handleSpeedTest)
+				r.Get("/logs", s.getLogs)
+				r.Get("/logs/rclone", s.getRcloneLogs)
+				r.Get("/ingests", s.handleIngests)
+				r.Get("/ingests/{debrid}", s.handleIngestsByDebrid)
+			})
 		})
 
-		//webhooks
-		r.Post("/webhooks/tautulli", s.handleTautulli)
-
+		// Webhooks. Mounted behind authentication: these endpoints launch
+		// repair work, which can delete files, so they must not be reachable
+		// without credentials.
+		r.Mount("/webhooks", s.webhookRoutes())
 	})
 	s.router = r
 	return s
 }
 
+func (s *Server) SetRestartFunc(restartFunc func()) {
+	s.restartFunc = restartFunc
+}
+
+func (s *Server) Restart() {
+	if s.restartFunc != nil {
+		time.Sleep(200 * time.Millisecond)
+		s.restartFunc()
+	} else {
+		s.logger.Warn().Msg("Restart function not set")
+	}
+}
+
 func (s *Server) Start(ctx context.Context) error {
 	cfg := config.Get()
+
+	// Start background stats collector
+	s.stats.Start(ctx)
 
 	addr := fmt.Sprintf("%s:%s", cfg.BindAddress, cfg.Port)
 	s.logger.Info().Msgf("Starting server on %s%s", addr, cfg.URLBase)
@@ -80,7 +201,7 @@ func (s *Server) Start(ctx context.Context) error {
 }
 
 func (s *Server) getLogs(w http.ResponseWriter, r *http.Request) {
-	logFile := filepath.Join(logger.GetLogPath(), "decypharr.log")
+	logFile := filepath.Join(logger.GetLogPath(), "climount.log")
 
 	// Open and read the file
 	file, err := os.Open(logFile)
@@ -104,7 +225,6 @@ func (s *Server) getLogs(w http.ResponseWriter, r *http.Request) {
 
 	// Stream the file
 	if _, err := io.Copy(w, file); err != nil {
-		s.logger.Error().Err(err).Msg("Error streaming log file")
 		http.Error(w, "Error streaming log file", http.StatusInternalServerError)
 		return
 	}
@@ -122,9 +242,7 @@ func (s *Server) getRcloneLogs(w http.ResponseWriter, r *http.Request) {
 	defer func(file *os.File) {
 		err := file.Close()
 		if err != nil {
-			s.logger.Error().Err(err).Msg("Error closing log file")
 			return
-
 		}
 	}(file)
 
@@ -137,8 +255,175 @@ func (s *Server) getRcloneLogs(w http.ResponseWriter, r *http.Request) {
 
 	// Stream the file
 	if _, err := io.Copy(w, file); err != nil {
-		s.logger.Error().Err(err).Msg("Error streaming log file")
-		http.Error(w, "Error streaming log file", http.StatusInternalServerError)
+		http.Error(w, fmt.Sprintf("error stremaing file %s", err), http.StatusInternalServerError)
 		return
 	}
+}
+
+// LogsHandler serves the in-page log viewer.
+func (s *Server) LogsHandler(w http.ResponseWriter, r *http.Request) {
+	cfg := config.Get()
+	data := map[string]interface{}{
+		"URLBase": cfg.URLBase,
+		"Page":    "logs",
+		"Title":   "Logs",
+	}
+	err := s.templates.ExecuteTemplate(w, "layout", data)
+	if err != nil {
+		s.logger.Warn().Err(err).Msg("error rendering /logs template")
+	}
+}
+
+// handleGetLogsAPI returns the last N lines of the log file as JSON.
+// Query params: lines (default 2000), level (all/debug/info/warn/error), offset (line index to resume from)
+func (s *Server) handleGetLogsAPI(w http.ResponseWriter, r *http.Request) {
+	logFile := filepath.Join(logger.GetLogPath(), "climount.log")
+
+	maxLines := 2000
+	if v := r.URL.Query().Get("lines"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 10000 {
+			maxLines = n
+		}
+	}
+	levelFilter := strings.ToLower(r.URL.Query().Get("level"))
+
+	file, err := os.Open(logFile)
+	if err != nil {
+		// Return empty result if log file doesn't exist yet
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"lines":[]}`))
+		return
+	}
+	defer file.Close()
+
+	// Read all lines into a ring buffer of maxLines
+	var allLines []string
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			continue
+		}
+		// Apply level filter
+		if levelFilter != "" && levelFilter != "all" {
+			upper := strings.ToUpper(levelFilter)
+			// Log lines contain | LEVEL  | — check for the level marker
+			if !strings.Contains(line, "| "+upper) && !strings.Contains(line, "|"+upper) {
+				continue
+			}
+		}
+		allLines = append(allLines, line)
+	}
+
+	// Keep only the last maxLines
+	if len(allLines) > maxLines {
+		allLines = allLines[len(allLines)-maxLines:]
+	}
+
+	// JSON-encode manually to avoid escaping issues with log content
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-cache")
+	_, _ = fmt.Fprintf(w, `{"lines":[`)
+	for i, line := range allLines {
+		if i > 0 {
+			_, _ = fmt.Fprint(w, ",")
+		}
+		// Simple JSON string encoding
+		encoded := strings.ReplaceAll(line, `\`, `\\`)
+		encoded = strings.ReplaceAll(encoded, `"`, `\"`)
+		encoded = strings.ReplaceAll(encoded, "\n", `\n`)
+		encoded = strings.ReplaceAll(encoded, "\r", ``)
+		_, _ = fmt.Fprintf(w, `"%s"`, encoded)
+	}
+	_, _ = fmt.Fprintf(w, `],"total":%d}`, len(allLines))
+}
+
+// handleShareLogs collects all climount.log + rotated files, gzip-compresses them,
+// and uploads to paste.c-net.org. Returns {"url":"https://..."} on success.
+func (s *Server) handleShareLogs(w http.ResponseWriter, r *http.Request) {
+	logDir := logger.GetLogPath()
+	const maxLines = 1_500_000
+	const maxCompressedBytes = 50 * 1024 * 1024 // 50 MB
+
+	// Collect log files: rotated oldest-first, then current
+	entries, _ := os.ReadDir(logDir)
+	var rotated []string
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), "climount.log.") {
+			rotated = append(rotated, filepath.Join(logDir, e.Name()))
+		}
+	}
+	// sort descending by name so log.9 < log.1 — reverse for oldest-first
+	for i, j := 0, len(rotated)-1; i < j; i, j = i+1, j-1 {
+		rotated[i], rotated[j] = rotated[j], rotated[i]
+	}
+	files := append(rotated, filepath.Join(logDir, "climount.log"))
+
+	// Read up to maxLines lines (ring-buffer via slice rotation)
+	lines := make([]string, 0, maxLines)
+	for _, path := range files {
+		f, err := os.Open(path)
+		if err != nil {
+			continue
+		}
+		sc := bufio.NewScanner(f)
+		sc.Buffer(make([]byte, 1024*1024), 1024*1024)
+		for sc.Scan() {
+			if t := sc.Text(); t != "" {
+				if len(lines) >= maxLines {
+					lines = lines[1:]
+				}
+				lines = append(lines, t)
+			}
+		}
+		f.Close()
+	}
+
+	if len(lines) == 0 {
+		http.Error(w, `{"error":"no log data found"}`, http.StatusNotFound)
+		return
+	}
+
+	// Gzip compress
+	var buf bytes.Buffer
+	gz, _ := gzip.NewWriterLevel(&buf, gzip.BestCompression)
+	for _, l := range lines {
+		gz.Write([]byte(l))
+		gz.Write([]byte("\n"))
+	}
+	gz.Close()
+
+	if buf.Len() > maxCompressedBytes {
+		http.Error(w, `{"error":"compressed log exceeds 50MB limit"}`, http.StatusRequestEntityTooLarge)
+		return
+	}
+
+	// Upload to paste.c-net.org
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, "https://paste.c-net.org/", &buf)
+	if err != nil {
+		http.Error(w, `{"error":"failed to create upload request"}`, http.StatusInternalServerError)
+		return
+	}
+	req.Header.Set("X-FileName", "climount.log.gz")
+
+	client := &http.Client{Timeout: 300 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		s.logger.Error().Err(err).Msg("Share logs: upload failed")
+		http.Error(w, `{"error":"upload failed"}`, http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	url := strings.TrimSpace(string(body))
+	if !strings.HasPrefix(url, "https://") {
+		s.logger.Error().Str("body", url).Msg("Share logs: unexpected response")
+		http.Error(w, `{"error":"unexpected paste service response"}`, http.StatusBadGateway)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprintf(w, `{"url":%q}`, url)
 }
