@@ -108,6 +108,7 @@ class ConfigManager {
 
             const config = await response.json();
             this.loadedUsenet = config.usenet || {};
+            this.loadedMount = config.mount || {};
             this.populateForm(config);
 
         } catch (error) {
@@ -1597,7 +1598,8 @@ class ConfigManager {
             }
         };
 
-        return {
+        const savedDfs = (this.loadedMount && this.loadedMount.dfs) || {};
+        const dfs = {
             cache_dir: getElementValue('cache_dir'),
             disk_cache_size: getElementValue('disk_cache_size'),
             buffer_memory: getElementValue('buffer_memory'),
@@ -1610,6 +1612,25 @@ class ConfigManager {
             gid: getElementValue('gid', 0),
             umask: getElementValue('umask'),
         };
+
+        // Plex-page-only fields: Settings has no inputs for these, so carry
+        // forward the last loaded values instead of wiping them on save.
+        if (savedDfs.prewarm_next_episode) {
+            dfs.prewarm_next_episode = true;
+        } else if (savedDfs.prewarm_next_episode === false) {
+            dfs.prewarm_next_episode = false;
+        }
+        if (savedDfs.prewarm_max_size) {
+            dfs.prewarm_max_size = savedDfs.prewarm_max_size;
+        }
+        if (savedDfs.plex_url) {
+            dfs.plex_url = savedDfs.plex_url;
+        }
+        if (savedDfs.plex_token) {
+            dfs.plex_token = savedDfs.plex_token;
+        }
+
+        return dfs;
     }
 
     setupMagnetHandler() {
