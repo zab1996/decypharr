@@ -632,7 +632,7 @@ func (c *Client) getAnyAvailableConnection(ctx context.Context, exclusions provi
 
 	if eligibleCount == 0 {
 		releaseBudget()
-		return nil, config.UsenetProvider{}, errors.New("no eligible providers available")
+		return nil, config.UsenetProvider{}, ErrNoEligibleProviders
 	}
 
 	// Phase 2: All providers in this tier busy - race for first available
@@ -749,7 +749,7 @@ func (c *Client) raceForConnection(ctx context.Context, eligible []config.Usenet
 				if lastErr != nil {
 					return nil, config.UsenetProvider{}, lastErr
 				}
-				return nil, config.UsenetProvider{}, errors.New("failed to get connection from any provider")
+				return nil, config.UsenetProvider{}, ErrNoProviderConnection
 			}
 			if r.err == nil && r.conn != nil {
 				if winConn == nil {
